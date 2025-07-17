@@ -26,7 +26,7 @@ static WORKSPACE_IDS: AtomicUsize = AtomicUsize::new(0);
 
 /// Identifier of a [`Workspace`].
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct WorkspaceId(usize);
+pub struct WorkspaceId(pub usize);
 impl WorkspaceId {
     /// Create a unique [`WorkspaceId`].
     ///
@@ -40,11 +40,11 @@ impl std::fmt::Debug for WorkspaceId {
         write!(f, "workspace-{}", self.0)
     }
 }
-
-#[derive(Debug)]
-struct InteractiveSwap {
-    window: Window,
-    initial_window_location: Point<i32, Logical>,
+impl std::ops::Deref for WorkspaceId {
+    type Target = usize;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Debug)]
@@ -141,13 +141,6 @@ pub struct Workspace {
     /// If the specified index is [`None`], all [`Tile`]s should fade.
     fullscreen_fade_animation: Option<(Option<usize>, Animation<f32>)>,
 
-    /// An interactive tile "swap".
-    ///
-    /// It can
-    /// - Swap two **tiled** (non-floating) tiles in the tile list
-    /// - Move around floating tiles
-    interactive_swap: Option<InteractiveSwap>,
-
     /// An interactive tile resize.
     interactive_resize: Option<InteractiveResize>,
 
@@ -174,7 +167,6 @@ impl Workspace {
             has_transient_layout_changes: false,
             render_offset: None,
             fullscreen_fade_animation: None,
-            interactive_swap: None,
             interactive_resize: None,
             config: Rc::clone(config),
         }
@@ -313,9 +305,9 @@ impl Workspace {
             );
         }
 
-        let _ = self.interactive_swap.take_if(|swap| {
-            !swap.window.alive() || !self.tiles.iter().any(|tile| *tile.window() == swap.window)
-        });
+        // let _ = self.interactive_swap.take_if(|swap| {
+        //     !swap.window.alive() || !self.tiles.iter().any(|tile| *tile.window() == swap.window)
+        // });
         let _ = self.interactive_resize.take_if(|swap| {
             !swap.window.alive() || !self.tiles.iter().any(|tile| *tile.window() == swap.window)
         });
@@ -388,7 +380,6 @@ impl Workspace {
     ///
     /// This will get clamped to a valid value when [`Workspace::refresh`] is called.
     pub fn set_active_tile_idx(&mut self, idx: usize) {
-        self.remove_current_fullscreen();
         self.active_tile_idx = Some(idx);
     }
 
@@ -428,19 +419,6 @@ impl Workspace {
         });
         self.arrange_tiles(animate);
         self.active_window()
-    }
-
-    /// Swap the two [`Tile`]s associated with these [`Window`]s
-    pub fn swap_tiles(&mut self, a: &Window, b: &Window, animate: bool) {
-        let Some(a_idx) = self.tiles.iter().position(|tile| tile.window() == a) else {
-            return;
-        };
-        let Some(b_idx) = self.tiles.iter().position(|tile| tile.window() == b) else {
-            return;
-        };
-
-        self.tiles.swap(a_idx, b_idx);
-        self.arrange_tiles(animate);
     }
 
     /// Swaps the currently active [`Tile`] with the next one.
@@ -522,6 +500,23 @@ impl Workspace {
     /// This includes the fullscreened [`Tile`], if any.
     pub fn tiles_mut(&mut self) -> impl ExactSizeIterator<Item = &mut Tile> {
         self.tiles.iter_mut()
+    }
+
+    /// Get an iterator over the [`Workspace`]'s [`Tile`]s, in the order they are rendered in.
+    ///
+    /// The first tile is the topmost one.
+    pub fn tiles_in_render_order(&self) -> impl Iterator<Item = &Tile> {
+        let fullscreen = self
+            .fullscreened_tile_idx
+            .and_then(|idx| self.tiles.get(idx))
+            .into_iter();
+
+        let (ontop_tiles, normal_tiles) = self
+            .tiles
+            .iter()
+            .partition::<Vec<_>, _>(|tile| tile.window().rules().ontop.unwrap_or(false));
+
+        fullscreen.chain(ontop_tiles).chain(normal_tiles)
     }
 
     /// Insert a [`Window`] inside this [`Workspace`].
@@ -642,6 +637,238 @@ impl Workspace {
         self.tiles[new_idx].stop_location_animation();
     }
 
+    /// Inserts a [`Tile`] inside this workspace.
+    ///
+    /// - If the tile is floating, it will just be added to the workspace at the same location.
+    /// - If the tile is tiled, it will try to insert it at the closest location possible in the
+    ///   tile stack, depending on where the pointer position in.
+    pub(super) fn insert_tile_with_cursor_position(
+        &mut self,
+        tile: Tile,
+        cursor_position: Point<i32, Logical>,
+    ) {
+        if self.tiles.is_empty() || !tile.window().tiled() {
+            self.tiles.push(tile);
+            self.active_tile_idx = Some(self.tiles.len() - 1);
+            self.arrange_tiles(true);
+            return;
+        }
+
+        if let Some(_) = self
+            .fullscreened_tile_idx
+            .and_then(|idx| self.tiles.get(idx))
+        {
+            let idx = self.fullscreened_tile_idx.unwrap();
+            // If there's a fullscreened tile, just insert it and unfullscreen
+            self.remove_current_fullscreen();
+            self.tiles.insert(idx, tile);
+
+            return;
+        }
+
+        // First we need to first the closest tile.
+        let (cursor_x, cursor_y) = cursor_position.into();
+        let (closest_idx, closest_tile) = self
+            .tiles
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, tile)| {
+                let (tile_x, tile_y) = tile.geometry().center().into();
+                i32::isqrt((tile_x - cursor_x).pow(2) + (tile_y - cursor_y).pow(2))
+            })
+            .expect("Should not be empty");
+        // Now, based on which quadrant of the closest tile we are in, we determine where to insert
+        // the final tile. So you can place the tile between two files, for example.
+        let cursor_position_in_tile = (cursor_position - closest_tile.location()).to_f64();
+        let size = closest_tile.size().to_f64();
+        let mut edges = ResizeEdge::empty();
+        if cursor_position_in_tile.x < size.w / 3. {
+            edges |= ResizeEdge::LEFT;
+        } else if 2. * size.w / 3. < cursor_position_in_tile.x {
+            edges |= ResizeEdge::RIGHT;
+        }
+        if cursor_position_in_tile.y < size.h / 3. {
+            edges |= ResizeEdge::TOP;
+        } else if 2. * size.h / 3. < cursor_position_in_tile.y {
+            edges |= ResizeEdge::BOTTOM;
+        }
+
+        // The actual handling depends on the layout.
+        match self.current_layout() {
+            WorkspaceLayout::Tile => {
+                if closest_idx < self.nmaster {
+                    if edges.intersects(ResizeEdge::RIGHT) && self.nmaster == self.tiles.len() {
+                        // We need a way to create a slave stack when there are only masters window,
+                        // this condition covers the following case:
+                        //
+                        // (the X marks where the cursor could be)
+                        //
+                        // +--------------------+
+                        // |              XXXXXX|
+                        // |              XXXXXX|
+                        // +--------------------+
+                        // +--------------------+
+                        // |              XXXXXX|
+                        // |              XXXXXX|
+                        // +--------------------+
+                        //
+                        // In this case we want to create a stack stack
+                        self.active_tile_idx = Some(self.tiles.len());
+                        self.tiles.push(tile);
+                    } else if edges.intersects(ResizeEdge::BOTTOM) {
+                        // Insert after this master window.
+                        self.nmaster += 1;
+                        self.active_tile_idx = Some(closest_idx + 1);
+                        self.tiles.insert(closest_idx + 1, tile);
+                    } else if edges.intersects(ResizeEdge::TOP) {
+                        self.nmaster += 1;
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                        // Insert before this master window.
+                    } else {
+                        // Swap the closest window and the grabbed window.
+                        // FIXME: This becomes invalid if the number of windows changed
+
+                        // First insert the grabbed tile.
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                    }
+                } else {
+                    if edges.intersects(ResizeEdge::BOTTOM) {
+                        // Insert after this stack window.
+                        self.active_tile_idx = Some(closest_idx + 1);
+                        self.tiles.insert(closest_idx + 1, tile);
+                    } else if edges.intersects(ResizeEdge::TOP) {
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                        // Insert before this stack window.
+                    } else {
+                        // Swap the closest window and the grabbed window.
+                        // FIXME: This becomes invalid if the number of windows changed
+
+                        // First insert the grabbed tile.
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                    }
+                }
+
+                self.arrange_tiles(true);
+            }
+            WorkspaceLayout::BottomStack => {
+                if closest_idx < self.nmaster {
+                    if edges.intersects(ResizeEdge::BOTTOM) && self.nmaster == self.tiles.len() {
+                        // We need a way to create a slave stack when there are only masters window,
+                        // this condition covers the following case:
+                        //
+                        // (the X marks where the cursor could be)
+                        //
+                        // +---------+----------+
+                        // |         |          |
+                        // |         |          |
+                        // |         |          |
+                        // |XXXXXXXXX|XXXXXXXXXX|
+                        // |XXXXXXXXX|XXXXXXXXXX|
+                        // +---------+----------+
+                        //
+                        // In this case we want to create a stack
+                        self.active_tile_idx = Some(self.tiles.len());
+                        self.tiles.push(tile);
+                    } else if edges.intersects(ResizeEdge::RIGHT) {
+                        // Insert after this master window.
+                        self.nmaster += 1;
+                        self.active_tile_idx = Some(closest_idx + 1);
+                        self.tiles.insert(closest_idx + 1, tile);
+                    } else if edges.intersects(ResizeEdge::LEFT) {
+                        // Insert before this master window.
+                        self.nmaster += 1;
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                    } else {
+                        // Swap the closest window and the grabbed window.
+                        // FIXME: This becomes invalid if the number of windows changed
+
+                        // First insert the grabbed tile.
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                    }
+                } else {
+                    if edges.intersects(ResizeEdge::RIGHT) {
+                        // Insert after this stack window.
+                        self.active_tile_idx = Some(closest_idx + 1);
+                        self.tiles.insert(closest_idx + 1, tile);
+                    } else if edges.intersects(ResizeEdge::LEFT) {
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                        // Insert before this stack window.
+                    } else {
+                        // Swap the closest window and the grabbed window.
+                        // FIXME: This becomes invalid if the number of windows changed
+
+                        // First insert the grabbed tile.
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                    }
+                }
+
+                self.arrange_tiles(true);
+            }
+            WorkspaceLayout::CenteredMaster => {
+                if closest_idx < self.nmaster {
+                    if edges.intersects(ResizeEdge::RIGHT) && self.nmaster == self.tiles.len() {
+                        // We need a way to create a slave stack when there are only masters window,
+                        // this condition covers the following case:
+                        //
+                        // (the X marks where the cursor could be)
+                        //
+                        // +--------------------+
+                        // |              XXXXXX|
+                        // |              XXXXXX|
+                        // +--------------------+
+                        // +--------------------+
+                        // |              XXXXXX|
+                        // |              XXXXXX|
+                        // +--------------------+
+                        //
+                        // In this case we want to create a stack stack
+                        self.active_tile_idx = Some(self.tiles.len());
+                        self.tiles.push(tile);
+                    } else if edges.intersects(ResizeEdge::BOTTOM) {
+                        // Insert after this master window.
+                        self.nmaster += 1;
+                        self.active_tile_idx = Some(closest_idx + 1);
+                        self.tiles.insert(closest_idx + 1, tile);
+                    } else if edges.intersects(ResizeEdge::TOP) {
+                        self.nmaster += 1;
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                        // Insert before this master window.
+                    } else {
+                        // Swap the closest window and the grabbed window.
+                        // FIXME: This becomes invalid if the number of windows changed
+
+                        // First insert the grabbed tile.
+                        self.active_tile_idx = Some(closest_idx);
+                        self.tiles.insert(closest_idx, tile);
+                    }
+                } else {
+                    // Centered master layout is way too confusing to get something that works right
+                    // with the dynamic layout system. Sooo, I am just not bothering for the slave
+                    // stack.
+                    self.active_tile_idx = Some(closest_idx);
+                    self.tiles.insert(closest_idx, tile);
+                }
+
+                self.arrange_tiles(true);
+            }
+            WorkspaceLayout::Floating => {
+                // Just insert it, who cares really.
+                self.tiles.push(tile);
+            }
+        }
+
+        self.arrange_tiles(true);
+    }
+
     /// Remove a [`Window`] from this [`Workspace`].
     ///
     /// This will remove the associated [`Tile`], if you want to run a close animation, see
@@ -729,7 +956,7 @@ impl Workspace {
         };
 
         let scale = self.output.current_scale().integer_scale();
-        tile.prepare_close_animation_if_needed(&self.output, renderer, scale);
+        tile.prepare_close_animation_if_needed(renderer, scale);
 
         true
     }
@@ -778,6 +1005,11 @@ impl Workspace {
                 .window()
                 .request_fullscreen(false);
         }
+    }
+
+    /// Get the current fullscreened [`Tile`] index.
+    pub fn fullscreened_tile_idx(&self) -> Option<usize> {
+        self.fullscreened_tile_idx
     }
 
     /// Get the current fullscreened [`Window`]
@@ -837,6 +1069,11 @@ impl Workspace {
         self.arrange_tiles(animate);
     }
 
+    /// The master width factor of this [`Workspace`].
+    pub fn mwfact(&self) -> f64 {
+        self.mwfact
+    }
+
     /// Change the master width factor of this [`Workspace`].
     pub fn change_mwfact(&mut self, delta: f64, animate: bool) {
         self.has_transient_layout_changes = true;
@@ -844,10 +1081,29 @@ impl Workspace {
         self.arrange_tiles(animate);
     }
 
+    /// Set the master width factor of this [`Workspace`].
+    pub fn set_mwfact(&mut self, value: f64, animate: bool) {
+        self.has_transient_layout_changes = true;
+        self.mwfact = value.clamp(0.01, 0.99);
+        self.arrange_tiles(animate);
+    }
+
+    /// The number of master windows factor of this [`Workspace`].
+    pub fn nmaster(&self) -> usize {
+        self.nmaster
+    }
+
     /// Change the number of master windows of this [`Workspace`].
     pub fn change_nmaster(&mut self, delta: i32, animate: bool) {
         self.has_transient_layout_changes = true;
         self.nmaster = self.nmaster.saturating_add_signed(delta as isize).max(1);
+        self.arrange_tiles(animate);
+    }
+
+    /// Set the number of master windows of this [`Workspace`].
+    pub fn set_nmaster(&mut self, value: usize, animate: bool) {
+        self.has_transient_layout_changes = true;
+        self.nmaster = value.max(1);
         self.arrange_tiles(animate);
     }
 
@@ -1387,136 +1643,31 @@ impl Workspace {
     /// Start an interactive swap grab.
     ///
     /// Returns [`true`] if the grab was successfully registered.
-    pub fn start_interactive_swap(&mut self, window: &Window) -> bool {
-        if self.interactive_swap.is_some() {
-            // Can't have two interactive swaps at a time.
-            return false;
-        }
-
-        let Some(tile) = self.tiles.iter().find(|tile| tile.window() == window) else {
+    pub(super) fn start_interactive_swap(&mut self, window: &Window) -> Option<Tile> {
+        let Some(idx) = self.tiles.iter().position(|tile| tile.window() == window) else {
             // Can't find the adequate tile
-            return false;
+            return None;
         };
 
-        if window.maximized() || window.fullscreen() {
-            return false;
+        if window.fullscreen() {
+            // Fullscreening should be exclusive.
+            assert_eq!(self.fullscreened_window().as_ref(), Some(window));
+            window.request_fullscreen(false);
+            self.fullscreened_tile_idx = None;
+            // Start fading in windows as we grab the fullscreened tile
+            self.start_fullscreen_fade_in(None);
         }
 
-        let initial_window_location = tile.location();
-        self.interactive_swap = Some(InteractiveSwap {
-            window: window.clone(),
-            initial_window_location,
-        });
+        // Reset window state
+        window.request_fullscreen(false);
+        window.request_maximized(false);
 
-        true
-    }
-
-    /// Handle an interactive swap grab motion.
-    ///
-    /// `delta` is how much the cursor moved from its initial window location.
-    ///
-    /// Returns [`true`] if the grab was successfully registered.
-    pub fn handle_interactive_swap_motion(
-        &mut self,
-        window: &Window,
-        delta: Point<i32, Logical>,
-    ) -> bool {
-        let Some(interactive_swap) = &self.interactive_swap else {
-            return false;
-        };
-
-        if interactive_swap.window != *window {
-            return false;
+        let tile = self.tiles.remove(idx);
+        if idx < self.nmaster {
+            self.nmaster = (self.nmaster - 1).max(1);
         }
-
-        let active_window = self.active_window();
-        if Some(window) != active_window.as_ref() {
-            return false;
-        }
-
-        let new_location = interactive_swap.initial_window_location + delta;
-        let Some(tile) = self.tiles.iter_mut().find(|tile| tile.window() == window) else {
-            // Can't find the adequate tile
-            return false;
-        };
-        tile.set_location(new_location, false);
-
-        true
-    }
-
-    /// Handle an interactive swap grab motion.
-    ///
-    /// `position` is the cursor position relative to the workspace.
-    ///
-    /// Returns [`true`] if the grab was successfully registered.
-    pub fn handle_interactive_swap_end(
-        &mut self,
-        window: &Window,
-        position: Point<f64, Logical>,
-    ) -> bool {
-        let Some(interactive_swap) = self.interactive_swap.take() else {
-            return false;
-        };
-
-        if interactive_swap.window != *window {
-            return false;
-        }
-
-        if window.tiled() && self.current_layout() != WorkspaceLayout::Floating {
-            // We only do the swap part if the window is tiled.
-            // Otherwise for floating windows just let them move
-            if let Some(other_window) = self
-                .tiles
-                .iter()
-                .filter(|tile| tile.window() != window)
-                .find(|tile| tile.geometry().to_f64().contains(position))
-                .map(Tile::window)
-                .cloned()
-            {
-                self.swap_tiles(window, &other_window, true);
-                if let Some(idx) = self.tiles.iter().position(|tile| tile.window() == window) {
-                    self.set_active_tile_idx(idx);
-                }
-            } else {
-                // We still run the arrange tiles function in order to get the swapped/grabbed
-                // window back to its original place.
-                self.arrange_tiles(true);
-            }
-        } else {
-            // If the window is floating, avoid letting it go out of bounds.
-            // We just give it a small edge around the screen
-            const MINIMUM_VISIBLE_SIZE: i32 = 100;
-            let minimum_rect = calculate_work_area(&self.output, MINIMUM_VISIBLE_SIZE);
-            let tile = self
-                .tiles
-                .iter_mut()
-                .find(|tile| tile.window() == window)
-                .unwrap();
-            let tile_geo = tile.geometry();
-
-            let mut target = Point::<_, Logical>::from((Option::<i32>::None, None));
-
-            if tile_geo.loc.x > minimum_rect.loc.x + minimum_rect.size.w {
-                target.x = Some(minimum_rect.loc.x + minimum_rect.size.w);
-            } else if tile_geo.loc.x + tile_geo.size.w < minimum_rect.loc.x {
-                target.x = Some(-tile_geo.size.w + MINIMUM_VISIBLE_SIZE);
-            }
-
-            if tile_geo.loc.y > minimum_rect.loc.y + minimum_rect.size.h {
-                target.y = Some(minimum_rect.loc.y + minimum_rect.size.h);
-            } else if tile_geo.loc.y + tile_geo.size.h < minimum_rect.loc.y {
-                target.y = Some(-tile_geo.size.h + MINIMUM_VISIBLE_SIZE);
-            }
-
-            let new_loc = Point::from((
-                target.x.unwrap_or(tile_geo.loc.x),
-                target.y.unwrap_or(tile_geo.loc.y),
-            ));
-
-            tile.set_location(new_loc, true);
-        }
-
-        true
+        self.arrange_tiles(true);
+        Some(tile)
     }
 
     /// Start an interactive resize grab.
@@ -1784,34 +1935,14 @@ impl Workspace {
             elements.push(element);
         }
 
-        if let Some(tile) = self.active_tile() {
-            let alpha = if self.active_tile_idx == skip_alpha_animation_idx {
-                1.0
-            } else {
-                alpha
-            };
+        let (ontop_tiles, normal_tiles) = self
+            .tiles
+            .iter()
+            .enumerate()
+            .partition::<Vec<_>, _>(|(_, tile)| tile.window().rules().ontop.unwrap_or(false));
 
-            // Active gets rendered above others.
-            elements.extend(
-                tile.render(renderer, scale, alpha, &self.output, render_offset, true)
-                    .map(|element| {
-                        RelocateRenderElement::from_element(
-                            element,
-                            render_offset_physical,
-                            Relocate::Relative,
-                        )
-                        .into()
-                    }),
-            );
-        }
-
-        // Now render others, just fine.
-        for (idx, tile) in self.tiles.iter().enumerate() {
-            // NOTE: active_tile_idx is always fullscreen_tile_idx, ensured by Workspace::refresh
-            if Some(idx) == self.active_tile_idx {
-                continue; // active tile has already been rendered.
-            }
-
+        // First render ontop tiles.
+        for (idx, tile) in ontop_tiles.into_iter() {
             let alpha = if Some(idx) == skip_alpha_animation_idx {
                 1.0
             } else {
@@ -1819,15 +1950,50 @@ impl Workspace {
             };
 
             elements.extend(
-                tile.render(renderer, scale, alpha, &self.output, render_offset, false)
-                    .map(|element| {
-                        RelocateRenderElement::from_element(
-                            element,
-                            render_offset_physical,
-                            Relocate::Relative,
-                        )
-                        .into()
-                    }),
+                tile.render(
+                    renderer,
+                    scale,
+                    alpha,
+                    &self.output,
+                    render_offset,
+                    Some(idx) == self.active_tile_idx,
+                )
+                .map(|element| {
+                    RelocateRenderElement::from_element(
+                        element,
+                        render_offset_physical,
+                        Relocate::Relative,
+                    )
+                    .into()
+                }),
+            );
+        }
+
+        // Now render others, just fine.
+        for (idx, tile) in normal_tiles.into_iter() {
+            let alpha = if Some(idx) == skip_alpha_animation_idx {
+                1.0
+            } else {
+                alpha
+            };
+
+            elements.extend(
+                tile.render(
+                    renderer,
+                    scale,
+                    alpha,
+                    &self.output,
+                    render_offset,
+                    Some(idx) == self.active_tile_idx,
+                )
+                .map(|element| {
+                    RelocateRenderElement::from_element(
+                        element,
+                        render_offset_physical,
+                        Relocate::Relative,
+                    )
+                    .into()
+                }),
             );
         }
 

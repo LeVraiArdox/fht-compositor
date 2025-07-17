@@ -60,6 +60,7 @@ fn default_keybinds() -> HashMap<KeyPattern, KeyActionDesc> {
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     pub autostart: Vec<String>,
+    pub env: HashMap<String, String>,
     #[serde(default = "default_keybinds")]
     pub keybinds: HashMap<KeyPattern, KeyActionDesc>,
     pub mousebinds: HashMap<MousePattern, MouseAction>,
@@ -81,6 +82,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             autostart: Default::default(),
+            env: Default::default(),
             keybinds: default_keybinds(),
             mousebinds: Default::default(),
             input: Default::default(),
@@ -355,7 +357,12 @@ pub enum MouseAction {
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Input {
     pub keyboard: Keyboard,
+    /// Configuration for generic mice.
     pub mouse: Mouse,
+    /// Configuration for touchpads.
+    pub touchpad: Mouse,
+    /// Configuration for trackpoints, usually found on thinkpads.
+    pub trackpoint: Mouse,
     pub per_device: HashMap<String, PerDeviceInput>,
 }
 
@@ -529,6 +536,8 @@ pub struct General {
     pub cursor_warps: bool,
     #[serde(default = "default_true")]
     pub focus_new_windows: bool,
+    #[serde(default = "default_false")]
+    pub focus_follows_mouse: bool,
     pub insert_window_strategy: InsertWindowStrategy,
     #[serde(default = "default_layouts")]
     pub layouts: Vec<WorkspaceLayout>,
@@ -547,6 +556,7 @@ impl Default for General {
         Self {
             cursor_warps: true,
             focus_new_windows: true,
+            focus_follows_mouse: false,
             insert_window_strategy: InsertWindowStrategy::default(),
             layouts: default_layouts(),
             nmaster: 1,
@@ -974,6 +984,7 @@ pub struct WindowRule {
     pub on_output: Option<String>,
     pub on_workspace: Option<usize>,
     pub is_focused: Option<bool>,
+    pub is_floating: Option<bool>,
     // Rules to apply
     pub open_on_output: Option<String>,
     pub open_on_workspace: Option<usize>,
@@ -986,6 +997,7 @@ pub struct WindowRule {
     pub maximized: Option<bool>,
     pub fullscreen: Option<bool>,
     pub floating: Option<bool>,
+    pub ontop: Option<bool>,
     pub centered: Option<bool>, // only effective if floating == Some(true)
 }
 
@@ -1264,9 +1276,14 @@ pub fn load(path: Option<path::PathBuf>) -> Result<(Config, Vec<path::PathBuf>),
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             info!(?path, "Creating configuration file");
-            let mut new_file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
-            let _ = new_file.write(DEFAULT_CONFIG_CONTENTS.as_bytes())?;
-            new_file
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let mut new_file = fs::File::create(&path)?;
+            new_file.write_all(DEFAULT_CONFIG_CONTENTS.as_bytes())?;
+
+            fs::OpenOptions::new().read(true).open(&path)?
         }
         Err(err) => return Err(err.into()),
     };

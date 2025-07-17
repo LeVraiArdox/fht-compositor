@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod pick_surface_grab;
 pub mod resize_tile_grab;
 pub mod swap_tile_grab;
 
@@ -30,7 +31,7 @@ use crate::output::OutputExt;
 use crate::state::State;
 
 impl State {
-    fn update_keyboard_focus(&mut self) {
+    pub fn update_keyboard_focus(&mut self) {
         crate::profile_function!();
         let keyboard = self.fht.keyboard.clone();
         let pointer = self.fht.pointer.clone();
@@ -49,7 +50,6 @@ impl State {
 
         let output = &self.fht.space.active_output().clone();
         let output_loc = output.current_location();
-
         let pointer_loc = pointer.current_location();
 
         if self.fht.is_locked() {
@@ -141,6 +141,9 @@ impl State {
     pub fn move_pointer(&mut self, point: Point<f64, Logical>) {
         let pointer = self.fht.pointer.clone();
         let under = self.fht.focus_target_under(point);
+        if self.fht.config.general.focus_follows_mouse && !pointer.is_grabbed() {
+            self.update_keyboard_focus();
+        }
 
         pointer.motion(
             self,
@@ -154,33 +157,12 @@ impl State {
                 },
             },
         );
+        self.fht.activate_pointer_constraint();
+
         pointer.frame(self);
 
         // FIXME: More granular, maybe check for where the point was and is now
         self.fht.queue_redraw_all();
-    }
-
-    pub fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
-        let (pos_x, pos_y) = pos.into();
-        let max_x = self
-            .fht
-            .space
-            .outputs()
-            .fold(0, |acc, o| acc + o.geometry().size.w);
-        let clamped_x = pos_x.clamp(0.0, max_x as f64);
-        let max_y = self
-            .fht
-            .space
-            .outputs()
-            .find(|o| o.geometry().contains((clamped_x as i32, 0)))
-            .map(|o| o.geometry().size.h);
-
-        if let Some(max_y) = max_y {
-            let clamped_y = pos_y.clamp(0.0, max_y as f64);
-            (clamped_x, clamped_y).into()
-        } else {
-            (clamped_x, pos_y).into()
-        }
     }
 
     pub fn process_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
@@ -373,7 +355,6 @@ impl State {
                 let serial = SERIAL_COUNTER.next_serial();
 
                 let mut pointer_locked = false;
-                let mut pointer_confined = false;
                 let mut confine_region = None;
 
                 if let Some((wl_surface, &surface_loc)) = under
@@ -394,7 +375,6 @@ impl State {
                                 match &*constraint {
                                     PointerConstraint::Locked(_) => pointer_locked = true,
                                     PointerConstraint::Confined(confine) => {
-                                        pointer_confined = true;
                                         confine_region = confine.region().cloned();
                                     }
                                 }
@@ -420,10 +400,29 @@ impl State {
                     return;
                 }
 
-                pointer_location += event.delta();
-                pointer_location = self.clamp_coords(pointer_location);
-                let new_under = self.fht.focus_target_under(pointer_location);
+                let mut new_pos = pointer_location + event.delta();
+                if self
+                    .fht
+                    .space
+                    .outputs()
+                    .find(|o| o.geometry().to_f64().contains(pointer_location))
+                    .is_none()
+                {
+                    // Clamp the pointer location to the previous output
+                    let previous_output = self.fht.space.active_output().clone();
+                    let geometry = previous_output.geometry();
+                    new_pos.x = new_pos.x.clamp(
+                        geometry.loc.x as f64,
+                        (geometry.loc.x + geometry.size.w - 1) as f64,
+                    );
+                    new_pos.y = new_pos.y.clamp(
+                        geometry.loc.y as f64,
+                        (geometry.loc.y + geometry.size.h - 1) as f64,
+                    );
+                }
+                pointer_location = new_pos;
 
+                let new_under = self.fht.focus_target_under(pointer_location);
                 let maybe_new_output = self
                     .fht
                     .space
@@ -435,20 +434,27 @@ impl State {
                 }
 
                 // Confine pointer if possible.
-                if pointer_confined {
+                if confine_region.is_some() {
                     if let Some((ft, loc)) = &under {
-                        if new_under.as_ref().and_then(|(ft, _)| ft.wl_surface()) != ft.wl_surface()
+                        if new_under
+                            .as_ref()
+                            .and_then(|(new_ft, _)| new_ft.wl_surface())
+                            != ft.wl_surface()
                         {
                             pointer.frame(self);
                             return;
                         }
                         if confine_region.is_some_and(|region| {
-                            region.contains((pointer_location - *loc).to_i32_round())
+                            !region.contains((pointer_location - *loc).to_i32_round())
                         }) {
                             pointer.frame(self);
                             return;
                         }
                     }
+                }
+
+                if self.fht.config.general.focus_follows_mouse && !pointer.is_grabbed() {
+                    self.update_keyboard_focus();
                 }
 
                 pointer.motion(
@@ -462,25 +468,8 @@ impl State {
                 );
                 pointer.frame(self);
 
-                // If pointer is now in a constraint region, activate it
-                // TODO: Anywhere else pointer is moved needs to do this (in the self.move_pointer
-                // function)
-                if let Some((under, surface_location)) = new_under
-                    .and_then(|(target, loc)| Some((target.wl_surface()?.into_owned(), loc)))
-                {
-                    with_pointer_constraint(&under, &pointer, |constraint| match constraint {
-                        Some(constraint) if !constraint.is_active() => {
-                            let point = pointer_location.to_i32_round() - surface_location;
-                            if constraint
-                                .region()
-                                .is_none_or(|region| region.contains(point.to_i32_round()))
-                            {
-                                constraint.activate();
-                            }
-                        }
-                        _ => {}
-                    });
-                }
+                // Try to activate new pointer constraint, if any.
+                self.fht.activate_pointer_constraint();
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 let output_geo = self.fht.space.active_output().geometry();
@@ -490,6 +479,9 @@ impl State {
 
                 let pointer = self.fht.pointer.clone();
                 let under = self.fht.focus_target_under(pointer_location);
+                if self.fht.config.general.focus_follows_mouse && !pointer.is_grabbed() {
+                    self.update_keyboard_focus();
+                }
 
                 pointer.motion(
                     self,
@@ -501,6 +493,9 @@ impl State {
                     },
                 );
                 pointer.frame(self);
+
+                // Try to activate new pointer constraint, if any.
+                self.fht.activate_pointer_constraint();
             }
             InputEvent::PointerButton { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
@@ -630,13 +625,27 @@ impl State {
                         tool.wheel(event.wheel_delta(), event.wheel_delta_discrete());
                     }
 
-                    tool.motion(
-                        pointer_location,
-                        under.and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc))),
-                        &tablet,
-                        SERIAL_COUNTER.next_serial(),
-                        event.time_msec(),
-                    );
+                    if let Some(under_with_loc) = under
+                        .clone()
+                        .and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc)))
+                    {
+                        tool.motion(
+                            pointer_location,
+                            Some(under_with_loc),
+                            &tablet,
+                            SERIAL_COUNTER.next_serial(),
+                            event.time_msec(),
+                        );
+                    } else {
+                        tool.motion(
+                            pointer_location,
+                            under
+                                .and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc))),
+                            &tablet,
+                            SERIAL_COUNTER.next_serial(),
+                            event.time_msec(),
+                        );
+                    }
                 }
                 pointer.frame(self);
             }
@@ -671,11 +680,10 @@ impl State {
                 );
                 pointer.frame(self);
 
-                if let (Some(under), Some(tablet), Some(tool)) = (
-                    under.and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc))),
-                    tablet,
-                    tool,
-                ) {
+                let under =
+                    under.and_then(|(f, loc)| f.wl_surface().map(|s| (s.into_owned(), loc)));
+
+                if let (Some(under), Some(tablet), Some(tool)) = (under, tablet, tool) {
                     match event.state() {
                         ProximityState::In => tool.proximity_in(
                             pointer_location,

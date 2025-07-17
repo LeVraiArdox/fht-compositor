@@ -53,11 +53,11 @@ pub enum KeyActionType {
 #[derive(Debug, Clone)]
 pub struct KeyAction {
     /// The type of the [`KeyAction`], I.E what to do.
-    r#type: KeyActionType,
+    pub r#type: KeyActionType,
     /// Whether we should allow this [`KeyAction`] to be executed while the compositor is locked.
-    allow_while_locked: bool,
+    pub allow_while_locked: bool,
     /// Whether we should repeat this key binding.
-    repeat: bool,
+    pub repeat: bool,
 }
 
 impl KeyAction {
@@ -284,8 +284,8 @@ impl State {
                 let output_geometry = active.output().geometry();
                 if let Some(tile) = active.active_tile_mut() {
                     if !tile.window().tiled() {
-                        let loc = tile.location();
-                        tile.set_location(output_geometry.center() - loc.downscale(2), true);
+                        let size = tile.size();
+                        tile.set_location(output_geometry.center() - size.downscale(2), true);
                     }
                 }
             }
@@ -389,7 +389,9 @@ impl State {
                     let center = output.geometry().center();
                     self.move_pointer(center.to_f64());
                 }
-                self.fht.space.set_active_output(&output);
+                if let Some(window) = self.fht.space.set_active_output(&output) {
+                    self.set_keyboard_focus(Some(window));
+                }
             }
             KeyActionType::FocusPreviousOutput => {
                 let outputs: Vec<_> = self.fht.space.outputs().cloned().collect();
@@ -413,7 +415,9 @@ impl State {
                     let center = output.geometry().center();
                     self.move_pointer(center.to_f64());
                 }
-                self.fht.space.set_active_output(&output);
+                if let Some(window) = self.fht.space.set_active_output(&output) {
+                    self.set_keyboard_focus(Some(window));
+                }
             }
             KeyActionType::CloseFocusedWindow => {
                 if let Some(window) = active_window {
@@ -421,8 +425,9 @@ impl State {
                 }
             }
             KeyActionType::FocusWorkspace(idx) => {
+                let idx = (*idx).clamp(0, 8);
                 let mon = self.fht.space.active_monitor_mut();
-                if let Some(window) = mon.set_active_workspace_idx(*idx, true) {
+                if let Some(window) = mon.set_active_workspace_idx(idx, true) {
                     self.set_keyboard_focus(Some(window));
                 }
             }
@@ -510,7 +515,11 @@ impl State {
                         location: pointer_loc,
                     };
 
-                    if self.fht.space.start_interactive_swap(&window) {
+                    if self
+                        .fht
+                        .space
+                        .start_interactive_swap(&window, pointer_loc.to_i32_round())
+                    {
                         let grab = SwapTileGrab { window, start_data };
                         pointer.set_grab(self, grab, serial, Focus::Clear);
                         self.fht
@@ -565,9 +574,14 @@ impl State {
                         button,
                         location: pointer_loc,
                     };
+                    let output = workspace.output().clone();
                     if self.fht.space.start_interactive_resize(&window, edges) {
                         window.request_resizing(true);
-                        let grab = ResizeTileGrab { window, start_data };
+                        let grab = ResizeTileGrab {
+                            window,
+                            output,
+                            start_data,
+                        };
                         pointer.set_grab(self, grab, serial, Focus::Clear);
                         self.fht
                             .cursor_theme_manager

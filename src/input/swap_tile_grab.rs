@@ -1,8 +1,8 @@
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
-    GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-    GestureSwipeUpdateEvent, GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle,
-    RelativeMotionEvent,
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
+    GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
+    GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData,
+    MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
 };
 use smithay::utils::{Logical, Point};
 
@@ -29,11 +29,11 @@ impl PointerGrab<State> for SwapTileGrab {
     ) {
         // No focus while motion is active
         handle.motion(data, None, event);
-        let delta = (event.location - self.start_data.location).to_i32_round();
+
         if data
             .fht
             .space
-            .handle_interactive_swap_motion(&self.window, delta)
+            .handle_interactive_swap_motion(&self.window, event.location.to_i32_round())
         {
             return;
         }
@@ -155,5 +155,10 @@ impl PointerGrab<State> for SwapTileGrab {
         &self.start_data
     }
 
-    fn unset(&mut self, _: &mut State) {}
+    fn unset(&mut self, state: &mut State) {
+        state
+            .fht
+            .cursor_theme_manager
+            .set_image_status(CursorImageStatus::Named(CursorIcon::Default));
+    }
 }

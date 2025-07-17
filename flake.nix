@@ -32,6 +32,7 @@
       seatd,
       libxkbcommon,
       mesa,
+      libgbm,
       pipewire,
       dbus,
       wayland,
@@ -43,7 +44,7 @@
       withUdevBackend ? true,
       withWinitBackend ? true,
       withXdgScreenCast ? true,
-      withUWSM ? true,
+      withSystemd ? true,
       withProfiling ? false,
     }:
       rustPlatform.buildRustPackage {
@@ -61,6 +62,12 @@
           installShellCompletion completions/*
         '';
 
+        postPatch = ''
+          patchShebangs res/systemd/fht-compositor-session
+          substituteInPlace res/systemd/fht-compositor.service \
+            --replace-fail '/usr/bin' "$out/bin"
+        '';
+
         cargoLock = {
           # NOTE: Since dependencies such as smithay are only distributed with git,
           # we are forced to allow cargo to fetch them.
@@ -72,7 +79,7 @@
 
         nativeBuildInputs = [rustPlatform.bindgenHook pkg-config installShellFiles];
         buildInputs =
-          [libGL libdisplay-info libinput seatd libxkbcommon mesa wayland]
+          [libGL libdisplay-info libinput seatd libxkbcommon mesa libgbm wayland]
           ++ lib.optional withXdgScreenCast dbus
           ++ lib.optional withXdgScreenCast pipewire;
 
@@ -81,14 +88,19 @@
           lib.optional withXdgScreenCast "xdg-screencast-portal"
           ++ lib.optional withWinitBackend "winit-backend"
           ++ lib.optional withUdevBackend "udev-backend"
-          ++ lib.optional withProfiling "profile-with-puffin"
-          ++ lib.optional withUWSM "uwsm";
+          ++ lib.optional withSystemd "systemd"
+          ++ lib.optional withProfiling "profile-with-puffin";
         buildNoDefaultFeatures = true;
 
         postInstall =
           ''
-            # Install generic session script
-            install -Dm644 res/fht-compositor.desktop -t $out/share/wayland-sessions
+            # Install .desktop file to be discoverable by Login managers
+            install -Dm644 res/systemd/fht-compositor.desktop -t $out/share/wayland-sessions
+            # And install systemd service files used by the .desktop file, including
+            # the script that sets up the session
+            install -Dm755 res/systemd/fht-compositor-session -t $out/bin/
+            install -Dm644 res/systemd/fht-compositor.service -t $out/share/systemd/user
+            install -Dm644 res/systemd/fht-compositor-shutdown.target -t $out/share/systemd/user
           ''
           + lib.optionalString withXdgScreenCast ''
             install -Dm644 res/fht-compositor.portal -t $out/share/xdg-desktop-portal/portals
@@ -151,18 +163,21 @@
           rust-bin = inputs.rust-overlay.lib.mkRustBin {} pkgs;
           inherit (self'.packages) fht-compositor;
         in
-          pkgs.mkShell {
+          pkgs.mkShell.override {
+            stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.clangStdenv;
+          } {
             packages = [
               # For developement purposes, a nightly toolchain is preferred.
               # We use nightly cargo for formatting, though compiling is limited to
               # whatever is specified inside ./rust-toolchain.toml
               (rust-bin.selectLatestNightlyWith (toolchain:
                 toolchain.default.override {
-                  extensions = ["rust-analyzer" "rust-src"];
+                  extensions = ["rust-analyzer" "rust-src" "rustc-codegen-cranelift-preview"];
                 }))
               pkgs.tracy-wayland # profiler
               pkgs.alejandra # for formatting this flake if needed
               pkgs.nodePackages.prettier # formatting documentation
+              pkgs.nodejs # vitepress for docs
             ];
 
             inherit (fht-compositor) buildInputs nativeBuildInputs;
@@ -172,7 +187,7 @@
               # in the package expression
               #
               # This should only be set with `CARGO_BUILD_RUSTFLAGS="$CARGO_BUILD_RUSTFLAGS -C your-flags"`
-              CARGO_BUILD_RUSTFLAGS = fht-compositor.RUSTFLAGS;
+              CARGO_BUILD_RUSTFLAGS = "${fht-compositor.RUSTFLAGS} -Zcodegen-backend=cranelift";
             };
           };
       };
@@ -189,29 +204,12 @@
           cfg = config.programs.fht-compositor;
           fht-share-picker-pkg = inputs.fht-share-picker.packages."${pkgs.system}".default;
           wayland-session = import (inputs.nixpkgs + "/nixos/modules/programs/wayland/wayland-session.nix");
-          # NOTE: If user uses custom package it will break the options provided in the module, but
-          # this is what official nixos modules seem todo (take for example the steam one)
-          defaultPackage = pkgs.callPackage fht-compositor-package {
-            inherit (cfg) withUWSM;
-          };
         in {
           options.programs.fht-compositor = {
             enable = lib.mkEnableOption "fht-compositor";
-            withUWSM =
-              lib.mkEnableOption null
-              // {
-                default = true;
-                # FIXME: Make a note about using uswm for slices
-                description = ''
-                  Launch the fht-compositor session with UWSM (Universal Wayland Session Manager).
-                  Using this is highly recommended since it improves fht-compositor's systemd
-                  support by binding appropriate targets like `graphical-session.target`,
-                  `wayland-session@fht-compositor.target`, etc. for a regular desktop session.
-                '';
-              };
             package = lib.mkOption {
               type = lib.types.package;
-              default = defaultPackage;
+              default = pkgs.callPackage fht-compositor-package { };
             };
           };
 
@@ -248,34 +246,7 @@
                 };
               }
 
-              (lib.mkIf (builtins.elem "xdg-screencast-portal" cfg.package.buildFeatures) {
-                # Install the share-picker application in order to select what to screencast.
-                # NOTE: the wayland-session.nix included in nixpkgs provides us with GTK and dconf
-                environment.systemPackages = [fht-share-picker-pkg];
-                xdg.portal.configPackages = [cfg.package];
-              })
-
-              # Use UWSM.
-              (lib.mkIf cfg.withUWSM {
-                programs = {
-                  uwsm = {
-                    enable = true;
-                    waylandCompositors."fht-compositor" = {
-                      prettyName = "fht-compositor";
-                      comment = "A dynamic tiling wayland compositor";
-                      binPath = let
-                        # To make the compositor run `uwsm finalize`, we must pass the --uwsm flag
-                        # The easier way to achieve this is by using a wrapper script.
-                        wrapperWithFlag = pkgs.writeShellScript "fht-compositor-with-uwsm.sh" ''
-                          /run/current-system/sw/bin/fht-compositor --uwsm
-                        '';
-                      in "${wrapperWithFlag}";
-                    };
-                  };
-                };
-              })
-              # Otherwise just install a simple .desktop file
-              (lib.mkIf (!cfg.withUWSM) {
+              {
                 # Install the fht-compositor package to display servers in order to make the .desktop
                 # file discoverable (providing a fht-compositor desktop entry)
                 services =
@@ -286,6 +257,13 @@
                   else {
                     xserver.displayManager.sessionPackages = [cfg.package];
                   };
+              }
+
+              (lib.mkIf (builtins.elem "xdg-screencast-portal" cfg.package.buildFeatures) {
+                # Install the share-picker application in order to select what to screencast.
+                # NOTE: the wayland-session.nix included in nixpkgs provides us with GTK and dconf
+                environment.systemPackages = [fht-share-picker-pkg];
+                xdg.portal.configPackages = [cfg.package];
               })
 
               (wayland-session {
@@ -320,16 +298,11 @@
               result = tomlFormat.generate name value;
               # Then we evaluate the result
               checkResult = pkgs.runCommand "fht-compositor-check-configuration" {} ''
-                mkdir -p $out;
-                ${cfg.package}/bin/fht-compositor --config-path ${result} check-configuration > $out/stdout
-                echo $? > $out/exit-code
+                ${cfg.package}/bin/fht-compositor --config-path ${result} check-configuration
+                ln -s ${result} $out
               '';
-
-              exitCode = lib.strings.toInt (builtins.readFile "${checkResult}/exit-code");
             in
-              if exitCode == 0
-              then result
-              else throw (builtins.readFile "${checkResult}/stdout");
+              checkResult;
           };
         in {
           options.programs.fht-compositor = {

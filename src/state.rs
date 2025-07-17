@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use calloop::futures::Scheduler;
 use fht_compositor_config::{BlurOverrides, BorderOverrides, DecorationMode, ShadowOverrides};
 use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
 use smithay::backend::renderer::element::{
@@ -17,16 +18,16 @@ use smithay::desktop::utils::{
 };
 use smithay::desktop::{layer_map_for_output, PopupManager, WindowSurfaceType};
 use smithay::input::keyboard::{KeyboardHandle, Keysym, XkbConfig};
-use smithay::input::pointer::{CursorImageStatus, PointerHandle};
+use smithay::input::pointer::{CursorImageStatus, MotionEvent, PointerHandle};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
-use smithay::reexports::calloop::{LoopHandle, LoopSignal, RegistrationToken};
+use smithay::reexports::calloop::{self, LoopHandle, LoopSignal, RegistrationToken};
 use smithay::reexports::input::{self, DeviceCapability, SendEventsMode};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle};
+use smithay::utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER};
 use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, CompositorClientState, CompositorState, SurfaceData,
@@ -50,9 +51,10 @@ use smithay::wayland::security_context::{SecurityContext, SecurityContextState};
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
-use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState};
+use smithay::wayland::session_lock::SessionLockManagerState;
 use smithay::wayland::shell::wlr_layer::{Layer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
@@ -64,10 +66,9 @@ use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xdg_foreign::XdgForeignState;
 
 use crate::backend::Backend;
-use crate::cli;
 use crate::config::ui as config_ui;
 use crate::cursor::CursorThemeManager;
-use crate::focus_target::{KeyboardFocusTarget, PointerFocusTarget};
+use crate::focus_target::PointerFocusTarget;
 use crate::frame_clock::FrameClock;
 use crate::handlers::session_lock::LockState;
 use crate::output::{self, OutputExt, RedrawState};
@@ -75,13 +76,15 @@ use crate::output::{self, OutputExt, RedrawState};
 use crate::portals::screencast::{
     self, CursorMode, ScreencastSession, ScreencastSource, StreamMetadata,
 };
+use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::ScreencopyManagerState;
 use crate::renderer::blur::EffectsFramebuffers;
 use crate::space::{Space, WorkspaceId};
 #[cfg(feature = "xdg-screencast-portal")]
 use crate::utils::pipewire::{CastId, CastSource, PipeWire, PwToCompositor};
-use crate::utils::RectCenterExt;
+use crate::utils::{get_monotonic_time, RectCenterExt};
 use crate::window::Window;
+use crate::{cli, ipc};
 
 pub struct State {
     pub fht: Fht,
@@ -94,11 +97,12 @@ impl State {
         loop_handle: LoopHandle<'static, State>,
         loop_signal: LoopSignal,
         config_path: Option<std::path::PathBuf>,
+        ipc_server: Option<ipc::Server>,
         backend: Option<crate::cli::BackendType>,
         _socket_name: String,
     ) -> Self {
         #[allow(unused)]
-        let mut fht = Fht::new(dh, loop_handle, loop_signal, config_path);
+        let mut fht = Fht::new(dh, loop_handle, loop_signal, ipc_server, config_path);
         #[allow(unused)]
         let backend: crate::backend::Backend = if let Some(backend_type) = backend {
             match backend_type {
@@ -110,6 +114,10 @@ impl State {
                 cli::BackendType::Udev => crate::backend::udev::UdevData::new(&mut fht)
                     .unwrap()
                     .into(),
+                #[cfg(feature = "headless-backend")]
+                cli::BackendType::Headless => {
+                    crate::backend::headless::HeadlessData::new(&mut fht).into()
+                }
             }
         } else if std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() {
             info!("Detected (WAYLAND_)DISPLAY. Running in nested Winit window");
@@ -187,42 +195,10 @@ impl State {
             state => state,
         };
 
-        {
-            crate::profile_scope!("refresh_focus");
-            // Make sure the surface is not dead (otherwise wayland wont be happy)
-            // NOTE: focus_target from state is always guaranteed to be the same as keyboard focus.
-            if self.fht.is_locked() {
-                // If we are locked, locked surface of active output gets precedence before
-                // everything. This also includes pointer focus too.
-                //
-                // For example, the prompt of your lock screen might need keyboard input.
-                let active_output = self.fht.space.active_output().clone();
-                let output_state = self.fht.output_state.get(&active_output).unwrap();
-                if let Some(lock_surface) = output_state.lock_surface.clone() {
-                    // Focus new surface if its different to avoid spamming wl_keyboard::enter event
-                    let new_focus = KeyboardFocusTarget::LockSurface(lock_surface);
-                    if self.fht.keyboard.current_focus().as_ref() != Some(&new_focus) {
-                        self.set_keyboard_focus(Some(new_focus));
-                    }
-                } else {
-                    // We do not have a lock surface on active output, default to not focusing
-                    // anything.
-                    self.set_keyboard_focus(Option::<LockSurface>::None);
-                }
-            } else {
-                // We are focusing nothing, default to the active workspace focused window.
-                let old_focus_dead = self
-                    .fht
-                    .keyboard
-                    .current_focus()
-                    .is_some_and(|ft| !ft.alive());
-                {
-                    if old_focus_dead {
-                        self.set_keyboard_focus(self.fht.space.active_window());
-                    }
-                }
-            }
-        }
+        // NOTE: If we cleared lock surface, `SessionLockHandler::unlock` will call
+        // `State::update_keyboard_focus` to appropriatly update the focus of the keyboard.
+        // This is done only to keep pointer contents updated.
+        self.update_pointer_focus();
 
         {
             crate::profile_scope!("flush_clients");
@@ -235,6 +211,33 @@ impl State {
         Ok(())
     }
 
+    /// Refresh the pointer focus.
+    pub fn update_pointer_focus(&mut self) {
+        crate::profile_scope!("refresh_pointer_focus");
+        // We try to update the pointer focus. If the new one is not the same as the previous one we
+        // encountered, we send a motion and frame event to the new one.
+        let pointer = self.fht.pointer.clone();
+        let pointer_loc = pointer.current_location();
+        let new_focus = self.fht.focus_target_under(pointer_loc);
+        if new_focus.as_ref().map(|(ft, _)| ft) == pointer.current_focus().as_ref() {
+            return; // No updates, keep going
+        }
+
+        pointer.motion(
+            self,
+            new_focus,
+            &MotionEvent {
+                location: pointer_loc,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: get_monotonic_time().as_millis() as u32,
+            },
+        );
+        // After motion, try to activate new pointer constraint under surface
+        self.fht.activate_pointer_constraint();
+
+        pointer.frame(self);
+    }
+
     pub fn new_client_state(&self) -> ClientState {
         ClientState {
             compositor: CompositorClientState::default(),
@@ -244,6 +247,7 @@ impl State {
 
     pub fn redraw(&mut self, output: Output) {
         crate::profile_function!();
+
         // Verify our invariant.
         let output_state = self.fht.output_state.get_mut(&output).unwrap();
         assert!(output_state.redraw_state.is_queued());
@@ -256,13 +260,14 @@ impl State {
                 target_presentation_time,
                 !self.fht.config.animations.disable,
             );
+            // If we finished animating the config_ui this means its hidden.
+            // Clear the output its opened on
+            let _ = self.fht.config_ui_output.take_if(|_| !ongoing);
 
-            let monitor = self
+            ongoing |= self
                 .fht
                 .space
-                .monitor_mut_for_output(&output)
-                .expect("all outputs should be tracked by Space");
-            ongoing |= monitor.advance_animations(target_presentation_time);
+                .advance_animations(target_presentation_time, &output);
 
             ongoing
         };
@@ -363,7 +368,7 @@ impl State {
         // If we made it up to here, the configuration must be valid
         self.fht.config = config;
 
-        if old_config.outputs != self.fht.config.outputs {
+        if old_config.outputs != self.fht.config.outputs || self.fht.has_transient_output_changes {
             self.fht.reload_output_config();
         }
 
@@ -535,7 +540,8 @@ impl State {
 
             let render_formats = self
                 .backend
-                .with_renderer(|renderer| renderer.egl_context().dmabuf_render_formats().clone());
+                .with_renderer(|renderer| renderer.egl_context().dmabuf_render_formats().clone())
+                .expect("we should be in Udev backend when starting screencast");
 
             let (to_compositor, from_pw) = calloop::channel::channel();
             let token = self
@@ -602,6 +608,7 @@ impl State {
 pub struct Fht {
     pub display_handle: DisplayHandle,
     pub loop_handle: LoopHandle<'static, State>,
+    pub scheduler: Scheduler<()>,
     pub loop_signal: LoopSignal,
     pub stop: bool,
 
@@ -627,6 +634,11 @@ pub struct Fht {
     pub lock_state: LockState,
 
     pub output_state: HashMap<Output, output::OutputState>,
+    // Keep track whether we did some transient output changes.
+    //
+    // This can happen when you use a tool that interacts with the wlr-output-management protocol.
+    // When reloading the config, we want to undo those changes.
+    pub has_transient_output_changes: bool,
 
     pub config: Arc<fht_compositor_config::Config>,
     pub cli_config_path: Option<std::path::PathBuf>,
@@ -654,6 +666,12 @@ pub struct Fht {
     #[cfg(feature = "xdg-screencast-portal")]
     pub pipewire: Option<PipeWire>,
 
+    // Inter-process communication.
+    //
+    // We keep the IPC server and listener state here. But the actual handling is done inside
+    // a Generic calloop source.
+    pub ipc_server: Option<ipc::Server>,
+
     pub compositor_state: CompositorState,
     pub data_control_state: DataControlState,
     pub data_device_state: DataDeviceState,
@@ -662,6 +680,7 @@ pub struct Fht {
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     pub idle_notifier_state: IdleNotifierState<State>,
     pub layer_shell_state: WlrLayerShellState,
+    pub output_management_manager_state: OutputManagementManagerState,
     pub primary_selection_state: PrimarySelectionState,
     pub session_lock_manager_state: SessionLockManagerState,
     pub shm_state: ShmState,
@@ -675,8 +694,17 @@ impl Fht {
         dh: &DisplayHandle,
         loop_handle: LoopHandle<'static, State>,
         loop_signal: LoopSignal,
+        ipc_server: Option<ipc::Server>,
         config_path: Option<std::path::PathBuf>,
     ) -> Self {
+        let (executor, scheduler) =
+            calloop::futures::executor().expect("Failed to create scheduler");
+        loop_handle
+            .insert_source(executor, |_, _, _| {
+                // This executor only lives to drive futures, we don't really care about the output.
+            })
+            .unwrap();
+
         let mut config_ui = config_ui::ConfigUi::new();
         let (config, paths) = match fht_compositor_config::load(config_path.clone()) {
             Ok((config, paths)) => (config, paths),
@@ -713,6 +741,13 @@ impl Fht {
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<State>(dh);
         let dmabuf_state = DmabufState::new();
         let layer_shell_state = WlrLayerShellState::new::<State>(dh);
+        let output_management_manager_state =
+            OutputManagementManagerState::new::<State, _>(dh, |client| {
+                // Only privileded clients
+                client
+                    .get_data::<ClientState>()
+                    .is_none_or(|data| data.security_context.is_none())
+            });
         let shm_state =
             ShmState::new::<State>(dh, vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888]);
         let session_lock_manager_state = SessionLockManagerState::new::<State, _>(dh, |client| {
@@ -746,6 +781,7 @@ impl Fht {
                 .get_data::<ClientState>()
                 .is_none_or(|data| data.security_context.is_none())
         });
+        XdgDialogState::new::<State>(dh);
         XdgDecorationState::new::<State>(dh);
         FractionalScaleManagerState::new::<State>(dh);
         OutputManagerState::new_with_xdg_output::<State>(dh);
@@ -803,6 +839,8 @@ impl Fht {
         Self {
             display_handle: dh.clone(),
             loop_handle,
+            scheduler,
+
             loop_signal,
             stop: false,
 
@@ -825,6 +863,7 @@ impl Fht {
             idle_inhibiting_surfaces: Vec::new(),
 
             output_state: HashMap::new(),
+            has_transient_output_changes: false,
 
             config: Arc::new(config),
             cli_config_path: config_path,
@@ -840,6 +879,8 @@ impl Fht {
             #[cfg(feature = "xdg-screencast-portal")]
             pipewire: None,
 
+            ipc_server,
+
             compositor_state,
             data_control_state,
             data_device_state,
@@ -848,6 +889,7 @@ impl Fht {
             keyboard_shortcuts_inhibit_state,
             idle_notifier_state,
             layer_shell_state,
+            output_management_manager_state,
             primary_selection_state,
             shm_state,
             session_lock_manager_state,
@@ -888,6 +930,11 @@ impl Fht {
         }
         self.space.set_active_output(&output);
 
+        // wlr-output-management
+        self.output_management_manager_state
+            .add_head::<State>(&output);
+        self.output_management_manager_state.update::<State>();
+
         self.arrange_outputs(Some(output));
     }
 
@@ -895,11 +942,29 @@ impl Fht {
         info!(name = output.name(), "Removing output");
         self.space.remove_output(output);
         self.arrange_outputs(None);
+        // wlr-output-management
+        self.output_management_manager_state.remove_head(&output);
+        self.output_management_manager_state.update::<State>();
 
         // Cleanly close [`LayerSurface`] instead of letting them know their demise after noticing
         // the output is gone.
         for layer in layer_map_for_output(output).layers() {
             layer.layer_surface().send_close()
+        }
+    }
+
+    pub fn focus_output(&mut self, output: &Output) {
+        if let Some(window) = self.space.set_active_output(output) {
+            self.loop_handle.insert_idle(move |state| {
+                state.set_keyboard_focus(Some(window));
+            });
+
+            if self.config.general.cursor_warps {
+                let center = output.geometry().center();
+                self.loop_handle.insert_idle(move |state| {
+                    state.move_pointer(center.to_f64());
+                });
+            }
         }
     }
 
@@ -932,7 +997,17 @@ impl Fht {
         let output_state = self.output_state.get_mut(output).unwrap();
         let _ = output_state.debug_damage_tracker.take();
 
+        if let Some(lock_surface) = output_state.lock_surface.as_ref() {
+            // Resize lock surface to make sure it always covers up everything
+            lock_surface.with_pending_state(|state| {
+                let size = output.geometry().size;
+                state.size = Some((size.w as _, size.h as _).into());
+            });
+            lock_surface.send_configure();
+        }
+
         if let Some(buffer) = &mut output_state.lock_backdrop {
+            // Resize lock backdrop to make sure it always covers up everything
             buffer.resize(output.geometry().size);
         }
 
@@ -972,15 +1047,21 @@ impl Fht {
             output.change_current_state(None, Some(new_transform), Some(new_scale), None);
         }
 
+        // If we had previous output changes, we force re-apply all config.
+        let force = self.has_transient_output_changes;
         let outputs = self.space.outputs().cloned().collect::<Vec<_>>();
         outputs.iter().for_each(|o| self.output_resized(o));
-        self.loop_handle.insert_idle(|state| {
+        self.loop_handle.insert_idle(move |state| {
+            #[cfg(feature = "udev-backend")]
             #[allow(irrefutable_let_patterns)]
             if let Backend::Udev(udev) = &mut state.backend {
-                udev.reload_output_configuration(&mut state.fht);
+                udev.reload_output_configuration(&mut state.fht, force);
             }
             state.fht.arrange_outputs(None);
         });
+
+        // By now we would have applied everything aligned to our config.
+        self.has_transient_output_changes = false;
 
         // We don't have todo this since it should be done with State::reload_config
         // self.queue_redraw_all();
@@ -1023,9 +1104,8 @@ impl Fht {
                 .filter(|&target_pos| {
                     let target_geo = Rectangle::new(target_pos, size);
                     // if we have overlap, this position is not good, simple as that.
-                    if let Some(overlap) = self
-                        .space
-                        .outputs()
+                    if let Some(overlap) = arranged_outputs
+                        .iter()
                         .map(OutputExt::geometry)
                         .find(|geo| geo.overlaps(target_geo))
                     {
@@ -1084,6 +1164,11 @@ impl Fht {
         }
     }
 
+    /// Get the [`PointerFocusTarget`] under a given point and its location in global coordinate
+    /// space. We transform elements location from local to global space based on output
+    /// location and their position inside the output.
+    ///
+    /// A focus target is the surface that should get active pointer focus.
     pub fn focus_target_under(
         &self,
         point: Point<f64, Logical>,
@@ -1093,6 +1178,7 @@ impl Fht {
         let point_in_output = point - output_loc.to_f64();
         let layer_map = layer_map_for_output(output);
 
+        // If we have a lock surface, return it immediatly
         {
             let output_state = self.output_state.get(output).unwrap();
             if let Some(lock_surface) = &output_state.lock_surface {
@@ -1111,107 +1197,63 @@ impl Fht {
             }
         }
 
-        if let Some(layer) = layer_map.layer_under(Layer::Overlay, point_in_output) {
-            let layer_loc = layer_map.layer_geometry(layer).unwrap().loc;
-            if let Some((surface, surface_loc)) =
-                layer.surface_under(point_in_output - layer_loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                return Some((
-                    PointerFocusTarget::WlSurface(surface),
-                    (surface_loc + output_loc + layer_loc).to_f64(),
-                ));
-            }
-        }
-
-        if let Some((fullscreen, mut fullscreen_loc)) = self.space.fullscreened_window(point) {
-            fullscreen_loc -= fullscreen.render_offset();
-            let window_wl_surface = fullscreen.wl_surface().unwrap();
-            // NOTE: window location passed here is already global, since its from
-            // `Fht::window_geometry`
-            if let Some(ret) = fullscreen
-                .surface_under(
-                    point_in_output - fullscreen_loc.to_f64(),
-                    WindowSurfaceType::ALL,
-                )
-                .map(|(surface, surface_loc)| {
-                    if surface == *window_wl_surface {
-                        // Use the window immediatly when we are the toplevel surface.
-                        // PointerFocusTarget::Window to proceed (namely
-                        // State::process_mouse_action).
-                        (
-                            PointerFocusTarget::Window(fullscreen.clone()),
-                            (fullscreen_loc + output_loc).to_f64(),
-                        )
-                    } else {
-                        (
-                            PointerFocusTarget::from(surface),
-                            (surface_loc + fullscreen_loc + output_loc).to_f64(),
-                        )
-                    }
+        let layer_under = |layer| {
+            layer_map
+                .layer_under(layer, point_in_output)
+                .and_then(|layer| {
+                    let layer_loc = layer_map.layer_geometry(layer).unwrap().loc;
+                    layer
+                        .surface_under(point_in_output - layer_loc.to_f64(), WindowSurfaceType::ALL)
+                        .map(|(surface, surface_loc)| {
+                            (
+                                PointerFocusTarget::WlSurface(surface),
+                                (surface_loc + output_loc + layer_loc).to_f64(),
+                            )
+                        })
                 })
-            {
-                return Some(ret);
-            }
-        }
+        };
 
-        if let Some(layer) = layer_map.layer_under(Layer::Top, point_in_output) {
-            let layer_loc = layer_map.layer_geometry(layer).unwrap().loc;
-            if let Some((surface, surface_loc)) =
-                layer.surface_under(point_in_output - layer_loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                return Some((
-                    PointerFocusTarget::WlSurface(surface),
-                    (surface_loc + output_loc + layer_loc).to_f64(),
-                ));
-            }
-        }
+        let window_under = |fullscreen| {
+            let maybe_window = if fullscreen {
+                self.space.fullscreened_window_under(point)
+            } else {
+                self.space.window_under(point)
+            };
 
-        if let Some((window, window_loc)) = self.space.window_under(point) {
-            let window_wl_surface = window.wl_surface().unwrap();
-            // NOTE: window location passed here is already global, since its from
-            // `Fht::window_geometry`
-            if let Some(ret) = window
-                .surface_under(
-                    point_in_output - window_loc.to_f64(),
-                    WindowSurfaceType::ALL,
-                )
-                .map(|(surface, surface_loc)| {
-                    if surface == *window_wl_surface {
-                        // Use the window immediatly when we are the toplevel surface.
-                        // PointerFocusTarget::Window to proceed (namely
-                        // State::process_mouse_action).
-                        (
-                            PointerFocusTarget::Window(window.clone()),
-                            (window_loc + output_loc).to_f64(),
-                        )
-                    } else {
-                        (
-                            PointerFocusTarget::from(surface),
-                            (surface_loc + window_loc + output_loc).to_f64(),
-                        )
-                    }
-                })
-            {
-                return Some(ret);
-            }
-        }
+            maybe_window.and_then(|(window, window_loc)| {
+                let window_wl_surface = window.wl_surface().unwrap();
+                window
+                    .surface_under(
+                        point_in_output - window_loc.to_f64(),
+                        WindowSurfaceType::ALL,
+                    )
+                    .map(|(surface, surface_loc)| {
+                        if surface == *window_wl_surface {
+                            // Use the window immediatly when we are the toplevel surface.
+                            // PointerFocusTarget::Window to proceed (namely
+                            // State::process_mouse_action).
+                            (
+                                PointerFocusTarget::Window(window.clone()),
+                                (window_loc + output_loc).to_f64(),
+                            )
+                        } else {
+                            (
+                                PointerFocusTarget::from(surface),
+                                (surface_loc + window_loc + output_loc).to_f64(),
+                            )
+                        }
+                    })
+            })
+        };
 
-        if let Some(layer) = layer_map
-            .layer_under(Layer::Bottom, point)
-            .or_else(|| layer_map.layer_under(Layer::Background, point))
-        {
-            let layer_loc = layer_map.layer_geometry(layer).unwrap().loc;
-            if let Some((surface, surface_loc)) =
-                layer.surface_under(point_in_output - layer_loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                return Some((
-                    PointerFocusTarget::WlSurface(surface),
-                    (surface_loc + output_loc + layer_loc).to_f64(),
-                ));
-            }
-        }
-
-        None
+        // We must keep these in accordance with rendering order, otherwise there will be
+        // inconsistencies with how rendering is done and how input is handled.
+        layer_under(Layer::Overlay)
+            .or_else(|| window_under(true))
+            .or_else(|| layer_under(Layer::Top))
+            .or_else(|| window_under(false))
+            .or_else(|| layer_under(Layer::Bottom))
+            .or_else(|| layer_under(Layer::Background))
     }
 
     pub fn visible_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
@@ -1631,7 +1673,29 @@ impl Fht {
             // the pointer capability:
             // https://github.com/hyprwm/aquamarine/blob/752d0fbd141fabb5a1e7f865199b80e6e76f8d8e/src/backend/Session.cpp#L826
             if device.has_capability(DeviceCapability::Pointer) {
-                let mouse_config = per_device_config.map_or(&input_config.mouse, |c| &c.mouse);
+                // A pointer with a size is a touchpad
+                let is_touchpad = device.size().is_some_and(|(w, h)| w != 0. && h != 0.);
+                // Trackpoints are reported as pointingsticks in udev
+                // https://wayland.freedesktop.org/libinput/doc/latest/trackpoint-configuration.html
+                // And based on udev source, here's the property value we must search for
+                // https://github.com/systemd/systemd/blob/d38dd7d17a67fda3257905fa32f254cd7b7d5b83/src/udev/udev-builtin-input_id.c#L315
+                let is_trackpoint = unsafe { device.udev_device() }.is_some_and(|device| {
+                    device.property_value("ID_INPUT_POINTINGSTICK").is_some()
+                });
+
+                let mouse_config = per_device_config.map_or_else(
+                    || match (is_touchpad, is_trackpoint) {
+                        // Not a touchpad and not a trackpoint is just a generic mouse.
+                        (false, false) => &input_config.mouse,
+                        (true, false) => &input_config.touchpad,
+                        (false, true) => &input_config.trackpoint,
+                        _ => unreachable!(),
+                    },
+                    |cfg|
+                    // In the case we use the per-device config, the user already knows what device he's modifying,
+                    // so we just use the mouse attribute.
+                    &cfg.mouse,
+                );
 
                 if let Some(click_method) = mouse_config.click_method {
                     let _ = device.config_click_set_method(click_method.into());
@@ -1923,6 +1987,7 @@ pub struct ResolvedWindowRules {
     pub maximized: Option<bool>,
     pub fullscreen: Option<bool>,
     pub floating: Option<bool>,
+    pub ontop: Option<bool>,
     pub centered: Option<bool>,
     pub centered_in_parent: Option<bool>,
 }
@@ -1954,6 +2019,7 @@ impl ResolvedWindowRules {
                 current_output,
                 current_workspace_idx,
                 is_focused,
+                !window.tiled(),
             )
         }) {
             resolved_rules.border = resolved_rules.border.merge_with(rule.border);
@@ -1995,6 +2061,10 @@ impl ResolvedWindowRules {
             if let Some(centered) = rule.centered {
                 resolved_rules.centered = Some(centered);
             }
+
+            if let Some(ontop) = rule.ontop {
+                resolved_rules.ontop = Some(ontop);
+            }
         }
 
         resolved_rules
@@ -2007,6 +2077,7 @@ fn rule_matches(
     current_output: &str,
     current_workspace_idx: usize,
     is_focused: bool,
+    is_floating: bool,
 ) -> bool {
     if rule.match_all {
         // When the user wants to match all the match criteria onto the window, there's two
@@ -2052,6 +2123,12 @@ fn rule_matches(
             }
         }
 
+        if let Some(rule_is_floating) = rule.is_floating {
+            if rule_is_floating != is_floating {
+                return false;
+            }
+        }
+
         true
     } else {
         if let Some(window_title) = window.title() {
@@ -2088,6 +2165,12 @@ fn rule_matches(
 
         if let Some(rule_is_focused) = rule.is_focused {
             if rule_is_focused == is_focused {
+                return true;
+            }
+        }
+
+        if let Some(rule_is_floating) = rule.is_floating {
+            if rule_is_floating == is_floating {
                 return true;
             }
         }

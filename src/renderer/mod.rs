@@ -9,7 +9,6 @@
 pub mod blur;
 mod data;
 pub mod extra_damage;
-pub mod pixel_shader_element;
 pub mod render_elements;
 pub mod rounded_window;
 pub mod shaders;
@@ -25,6 +24,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::utils::RelocateRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, RenderElement};
 use smithay::backend::renderer::gles::{
     GlesError, GlesMapping, GlesTexture, Uniform, UniformValue,
@@ -55,7 +55,7 @@ use crate::cursor::CursorRenderElement;
 use crate::handlers::session_lock::SessionLockRenderElement;
 use crate::layer::{layer_elements, LayerShellRenderElement};
 use crate::protocols::screencopy::{ScreencopyBuffer, ScreencopyFrame};
-use crate::space::{MonitorRenderElement, MonitorRenderResult};
+use crate::space::{MonitorRenderElement, MonitorRenderResult, TileRenderElement};
 use crate::state::Fht;
 use crate::utils::get_monotonic_time;
 
@@ -64,6 +64,7 @@ crate::fht_render_elements! {
         Cursor = CursorRenderElement<R>,
         ConfigUi = ConfigUiRenderElement,
         Monitor = MonitorRenderElement<R>,
+        InteractiveSwapTile = RelocateRenderElement<TileRenderElement<R>>,
         LayerShell = LayerShellRenderElement<R>,
         SessionLock = SessionLockRenderElement<R>,
         Debug = DebugRenderElement,
@@ -165,7 +166,9 @@ impl Fht {
 
         if !self.config_ui.hidden() {
             // Draw config ui below cursor, only if we didnt start drawing it on another output.
-            let config_ui_output = self.config_ui_output.get_or_insert_with(|| output.clone());
+            let config_ui_output = self
+                .config_ui_output
+                .get_or_insert_with(|| self.space.active_output().clone());
             if config_ui_output == output {
                 if let Some(element) = self.config_ui.render(renderer, output, scale) {
                     rv.elements.push(element.into())
@@ -185,6 +188,11 @@ impl Fht {
         let overlay_elements = layer_elements(renderer, output, Layer::Overlay, &self.config);
         rv.elements.extend(overlay_elements);
 
+        // Interactive move tile goes above everything else
+        let interactive_move_elements = self.space.render_interactive_swap(renderer, output, scale);
+        rv.elements
+            .extend(interactive_move_elements.into_iter().map(Into::into));
+
         // Top layer shells sit between the normal windows and fullscreen windows.
         //
         // NOTE: About the location of render elements.
@@ -193,7 +201,7 @@ impl Fht {
         // the output its mapped in.
         //
         // We do not have to offset the render elements in order to position them on the Output.
-        let monitor = self.space.active_monitor();
+        let monitor = self.space.monitor_for_output(output).unwrap();
         let MonitorRenderResult {
             elements: monitor_elements,
             has_fullscreen,

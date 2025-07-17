@@ -15,16 +15,20 @@ use std::time::Duration;
 
 use fht_animation::AnimationCurve;
 pub use monitor::{Monitor, MonitorRenderElement, MonitorRenderResult};
+use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::desktop::WindowSurfaceType;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::seat::WaylandFocus;
+pub use tile::TileRenderElement;
 #[allow(unused)] // re-export WorkspaceRenderElement for screencopy type bounds
 pub use workspace::{Workspace, WorkspaceId, WorkspaceRenderElement};
 
 use crate::input::resize_tile_grab::ResizeEdge;
 use crate::output::OutputExt;
+use crate::renderer::FhtRenderer;
+use crate::utils::RectCenterExt;
 use crate::window::Window;
 
 mod closing_tile;
@@ -44,13 +48,25 @@ pub struct Space {
     /// this index is incremented by one.
     primary_idx: usize,
 
-    /// The index of the active [`Monitoir`].
+    /// The index of the active [`Monitor`].
     ///
     /// This should be the monitor that has the pointer cursor in its bounds.
     active_idx: usize,
 
+    /// Interactive move/swap state.
+    ///
+    /// It has to live in the space to handle cross-monitor tile moving.
+    interactive_swap: Option<InteractiveSwap>,
+
     /// Shared configuration with across the workspace system.
     config: Rc<Config>,
+}
+
+struct InteractiveSwap {
+    /// The tile currently being swapped around.
+    tile: tile::Tile,
+    /// We need to track on which outputs the tile is visible on, to render it accordingly.
+    overlap_outputs: Vec<Output>,
 }
 
 impl Space {
@@ -61,6 +77,7 @@ impl Space {
             monitors: vec![],
             primary_idx: 0,
             active_idx: 0,
+            interactive_swap: None,
             config: Rc::new(config),
         }
     }
@@ -68,9 +85,63 @@ impl Space {
     /// Run periodic clean-up tasks.
     pub fn refresh(&mut self) {
         crate::profile_function!();
+
+        if let Some(InteractiveSwap {
+            tile,
+            overlap_outputs,
+            ..
+        }) = &self.interactive_swap
+        {
+            tile.window().request_activated(true);
+            let bbox = tile.window().bbox();
+
+            for output in overlap_outputs {
+                let output_geometry = output.geometry();
+                let mut bbox = bbox;
+                bbox.loc = tile.location() + tile.window_loc() + output_geometry.loc;
+                if let Some(mut overlap) = output_geometry.intersection(bbox) {
+                    // overlap must be in window-local coordinates.
+                    overlap.loc -= bbox.loc;
+                    tile.window().enter_output(output, overlap);
+                }
+            }
+
+            tile.window().send_pending_configure();
+            tile.window().refresh();
+        }
+
         for (idx, monitor) in self.monitors.iter_mut().enumerate() {
             monitor.refresh(idx == self.active_idx)
         }
+    }
+
+    /// Advance the animations for the [`Monitor`] associated with this [`Output`].
+    pub fn advance_animations(
+        &mut self,
+        target_presentation_time: Duration,
+        output: &Output,
+    ) -> bool {
+        let mut ongoing = false;
+
+        if let Some(InteractiveSwap {
+            tile,
+            overlap_outputs,
+            ..
+        }) = &mut self.interactive_swap
+        {
+            if overlap_outputs.contains(output) {
+                if tile.advance_animations(target_presentation_time) {
+                    ongoing = true;
+                }
+            }
+        }
+
+        let Some(monitor) = self.monitors.iter_mut().find(|mon| mon.output() == output) else {
+            warn!("Called Space::advance_animations with invalid output");
+            return ongoing;
+        };
+
+        monitor.advance_animations(target_presentation_time) || ongoing
     }
 
     /// Reload the [`Config`] of the [`Space`].
@@ -92,6 +163,16 @@ impl Space {
         self.monitors.iter()
     }
 
+    /// Get a mutable iterator over the [`Space`]'s tracked [`Monitor`](s)
+    pub fn monitors_mut(&mut self) -> impl ExactSizeIterator<Item = &mut Monitor> {
+        self.monitors.iter_mut()
+    }
+
+    /// Get the [`Monitor`] associated with this [`Output`].
+    pub fn monitor_for_output(&self, output: &Output) -> Option<&Monitor> {
+        self.monitors.iter().find(|mon| mon.output() == output)
+    }
+
     /// Get the [`Monitor`] associated with this [`Output`].
     pub fn monitor_mut_for_output(&mut self, output: &Output) -> Option<&mut Monitor> {
         self.monitors.iter_mut().find(|mon| mon.output() == output)
@@ -99,11 +180,19 @@ impl Space {
 
     /// Get the visible [`Window`]s for the associated [`Output`].
     pub fn visible_windows_for_output(&self, output: &Output) -> impl Iterator<Item = &Window> {
-        self.monitors
+        let monitor_windows = self
+            .monitors
             .iter()
             .find(|mon| mon.output() == output)
             .into_iter()
-            .flat_map(|mon| mon.visible_windows())
+            .flat_map(|mon| mon.visible_windows());
+        let interactive_swap_window = self
+            .interactive_swap
+            .as_ref()
+            .filter(|swap| swap.overlap_outputs.contains(output))
+            .map(|swap| swap.tile.window());
+
+        interactive_swap_window.into_iter().chain(monitor_windows)
     }
 
     /// Get the [`Window`]s on the associated [`Output`].
@@ -123,12 +212,19 @@ impl Space {
     }
 
     /// Get an iterator of all the [`Windows`]s managed by this [`Space`].
-    #[allow(unused)]
     pub fn windows(&self) -> impl Iterator<Item = &Window> {
         self.monitors
             .iter()
             .flat_map(Monitor::workspaces)
             .flat_map(Workspace::windows)
+    }
+
+    /// Get a mutable iterator of all the [`Tile`]s managed by this [`Space`].
+    pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut tile::Tile> {
+        self.monitors
+            .iter_mut()
+            .flat_map(Monitor::workspaces_mut)
+            .flat_map(Workspace::tiles_mut)
     }
 
     /// Add an [`Output`] to this [`Space`].
@@ -193,6 +289,12 @@ impl Space {
         self.monitors.iter().any(|mon| mon.output() == output)
     }
 
+    /// Get the active [`Workspace`].
+    pub fn active_workspace(&self) -> &Workspace {
+        let monitor = &self.monitors[self.active_idx];
+        monitor.active_workspace()
+    }
+
     /// Get the [`WorkspaceId`] of the active [`Workspace`].
     pub fn active_workspace_id(&self) -> WorkspaceId {
         let monitor = &self.monitors[self.active_idx];
@@ -212,23 +314,41 @@ impl Space {
         active_workspace.active_window()
     }
 
-    /// Get the active [`Window`] of this [`Space`], if any.
+    /// Get a mutable reference to the active [`Tile`] of this [`Space`], if any.
+    pub fn active_tile_mut(&mut self) -> Option<&mut tile::Tile> {
+        let active_monitor = &mut self.monitors[self.active_idx];
+        let active_workspace = active_monitor.active_workspace_mut();
+        active_workspace.active_tile_mut()
+    }
+
+    /// Get the active [`Monitor`] index of this [`Space`]
+    pub fn active_monitor_idx(&self) -> usize {
+        self.active_idx
+    }
+
+    /// Get the primary [`Monitor`] index of this [`Space`]
+    pub fn primary_monitor_idx(&self) -> usize {
+        self.primary_idx
+    }
+
+    /// Get the active [`Monitor`] of this [`Space`], if any.
     pub fn active_monitor(&self) -> &Monitor {
         &self.monitors[self.active_idx]
     }
 
-    /// Get the active [`Window`] of this [`Space`], if any.
+    /// Get the active [`Monitor`] of this [`Space`], if any.
     pub fn active_monitor_mut(&mut self) -> &mut Monitor {
         &mut self.monitors[self.active_idx]
     }
 
     /// Set the active [`Output`]
-    pub fn set_active_output(&mut self, output: &Output) {
+    pub fn set_active_output(&mut self, output: &Output) -> Option<Window> {
         let Some(idx) = self.monitors.iter().position(|mon| mon.output() == output) else {
             error!("Tried to activate an output that is not tracked by the Space!");
-            return;
+            return None;
         };
         self.active_idx = idx;
+        self.monitors[idx].active_workspace().active_window()
     }
 
     /// Get the active [`Output`].
@@ -239,6 +359,13 @@ impl Space {
     /// Get the primary [`Output`].
     pub fn primary_output(&self) -> &Output {
         self.monitors[self.primary_idx].output()
+    }
+
+    /// Get the [`Workspace`] associated with this [`WorkspaceId`].
+    pub fn workspace_for_id(&self, workspace_id: WorkspaceId) -> Option<&Workspace> {
+        self.monitors
+            .iter()
+            .find_map(|mon| mon.workspaces().find(|ws| ws.id() == workspace_id))
     }
 
     /// Get the [`Workspace`] associated with this [`WorkspaceId`].
@@ -281,6 +408,16 @@ impl Space {
 
     /// Get the [`Window`] with this [`WlSurface`] as its toplevel surface
     pub fn find_window(&self, surface: &WlSurface) -> Option<Window> {
+        // First check for the window
+        if let Some(window) = self
+            .interactive_swap
+            .as_ref()
+            .filter(|swap| swap.tile.window().wl_surface().as_deref() == Some(surface))
+            .map(|swap| swap.tile.window().clone())
+        {
+            return Some(window);
+        }
+
         for monitor in &self.monitors {
             for workspace in monitor.workspaces() {
                 for tile in workspace.tiles() {
@@ -355,6 +492,20 @@ impl Space {
 
     /// Get the [`Output`] holding this window.
     pub fn output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        if let Some(swap) = self
+            .interactive_swap
+            .as_ref()
+            .filter(|swap| swap.tile.window().wl_surface().as_deref() == Some(surface))
+        {
+            // HACK: I really don't know how to handle this properly
+            // For now we just use the output that has the tile center.
+            let tile_center = swap.tile.geometry().center();
+            return swap
+                .overlap_outputs
+                .iter()
+                .find(|output| output.geometry().contains(tile_center));
+        }
+
         for monitor in &self.monitors {
             for workspace in monitor.workspaces() {
                 for tile in workspace.tiles() {
@@ -481,6 +632,29 @@ impl Space {
         false
     }
 
+    /// Float the [`Tile`] associated with this [`Window`].
+    pub fn float_window(&mut self, window: &Window, floating: bool, animate: bool) -> bool {
+        for monitor in &mut self.monitors {
+            for workspace in monitor.workspaces_mut() {
+                let mut arrange = false;
+                for tile in workspace.tiles_mut() {
+                    if tile.window() == window {
+                        window.request_tiled(!floating);
+                        arrange = true;
+                        break;
+                    }
+                }
+
+                if arrange {
+                    workspace.arrange_tiles(animate);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Fullscreen the [`Tile`] associated with this [`Window`].
     pub fn fullscreen_window(&mut self, window: &Window, animate: bool) -> bool {
         for monitor in &mut self.monitors {
@@ -510,7 +684,7 @@ impl Space {
     /// Get the fullscreen [`Window`] under the `point`, and its position in global space.
     ///
     /// `point` is expected to be in global coordinate space.
-    pub fn fullscreened_window(
+    pub fn fullscreened_window_under(
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(Window, Point<i32, Logical>)> {
@@ -559,58 +733,63 @@ impl Space {
         active.insert_window(window.clone(), animate);
     }
 
+    /// Move this [`Window`] to a given [`Workspace`].
+    pub fn move_window_to_workspace(
+        &mut self,
+        window: &Window,
+        workspace_id: WorkspaceId,
+        animate: bool,
+    ) {
+        // If we try to add the window back into its original workspace.
+        let mut original_workspace_id = None;
+        'monitors: for monitor in &mut self.monitors {
+            for workspace in monitor.workspaces_mut() {
+                if workspace.remove_window(window, true) {
+                    // We successfully removed the window,
+                    // Stop checking for other monitors
+                    original_workspace_id = Some(workspace.id());
+                    break 'monitors;
+                }
+            }
+        }
+        let Some(original_workspace_id) = original_workspace_id else {
+            // We did not find the window!? Do not proceed.
+            return;
+        };
+
+        let Some(target_workspace) = self
+            .monitors
+            .iter_mut()
+            .find_map(|mon| mon.workspaces_mut().find(|ws| ws.id() == workspace_id))
+        else {
+            // No matching monitor, insert back
+            let original_workspace = self
+                .workspace_mut_for_id(original_workspace_id)
+                .expect("original_workspace_id should always be valid");
+            original_workspace.insert_window(window.clone(), animate);
+            return;
+        };
+
+        target_workspace.insert_window(window.clone(), animate);
+    }
+
+    /// Get the fullscreen [`Window`] under the `point`, and its position in global space.
+
     /// Get the fullscreen [`Window`] under the `point`, and its position in global space.
     ///
     /// `point` is expected to be in global coordinate space.
     pub fn window_under(
         &self,
-        point: Point<f64, Logical>,
+        mut point: Point<f64, Logical>,
     ) -> Option<(Window, Point<i32, Logical>)> {
         let monitor = self
             .monitors
             .iter()
             .find(|mon| mon.output().geometry().to_f64().contains(point))?;
+        point -= monitor.output().current_location().to_f64(); // make relative to output
         let active = monitor.active_workspace();
 
-        // Fullscreened tile always get priority
-        if let Some(tile) = active.fullscreened_tile() {
-            let window = tile.window();
-            let loc = tile.location() + tile.window_loc();
-            let bbox = {
-                let mut bbox = window.bbox();
-                bbox.loc += loc;
-                bbox
-            };
-            let render_location = loc - window.render_offset();
-            if bbox.to_f64().contains(point)
-                && window
-                    .surface_under(point - render_location.to_f64(), WindowSurfaceType::ALL)
-                    .is_some()
-            {
-                return Some((window.clone(), render_location));
-            }
-        }
-
-        // Active tile is always above everything else
-        if let Some(tile) = active.active_tile() {
-            let window = tile.window();
-            let loc = tile.location() + tile.window_loc();
-            let bbox = {
-                let mut bbox = window.bbox();
-                bbox.loc += loc;
-                bbox
-            };
-            let render_location = loc - window.render_offset();
-            if bbox.to_f64().contains(point)
-                && window
-                    .surface_under(point - render_location.to_f64(), WindowSurfaceType::ALL)
-                    .is_some()
-            {
-                return Some((window.clone(), render_location));
-            }
-        }
-
-        for tile in active.tiles() {
+        for tile in active.tiles_in_render_order() {
             let window = tile.window();
             let loc = tile.location() + tile.window_loc();
             let bbox = {
@@ -653,13 +832,72 @@ impl Space {
         }
     }
 
+    /// Center a given window.
+    pub fn center_window(&mut self, window: &Window, animate: bool) {
+        if window.tiled() {
+            return;
+        }
+
+        for monitor in &mut self.monitors {
+            for workspace in monitor.workspaces_mut() {
+                let mut arrange = false;
+                let output_geometry = workspace.output().geometry();
+                for tile in workspace.tiles_mut() {
+                    if tile.window() == window {
+                        let size = tile.size();
+                        tile.set_location(output_geometry.center() - size.downscale(2), animate);
+                        arrange = true;
+                        break;
+                    }
+                }
+
+                if arrange {
+                    workspace.arrange_tiles(animate);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Start an interactive swap in the [`Workspace`] of this [`Window`].
     ///
     /// Returns [`true`] if the grab got started inside the [`Workspace`].
-    pub fn start_interactive_swap(&mut self, window: &Window) -> bool {
+    pub fn start_interactive_swap(
+        &mut self,
+        window: &Window,
+        pointer_loc: Point<i32, Logical>,
+    ) -> bool {
+        if self.interactive_swap.is_some() {
+            return false;
+        }
+
         for monitor in &mut self.monitors {
             for workspace in monitor.workspaces_mut() {
-                if workspace.start_interactive_swap(window) {
+                if let Some(mut tile) = workspace.start_interactive_swap(window) {
+                    // First move the tile instantly to global space
+                    tile.set_location(
+                        tile.location() + workspace.output().current_location(),
+                        false,
+                    );
+
+                    // Make the tile slightly smaller, just for aesthetic urposes and give a visual
+                    // clue that we grabbed it and is not in a swap state.
+                    if tile.window().tiled()
+                        || workspace.current_layout()
+                            != fht_compositor_config::WorkspaceLayout::Floating
+                    {
+                        let new_size = tile.size().to_f64().upscale(0.8).to_i32_round();
+                        let new_loc = pointer_loc - new_size.downscale(2);
+                        tile.set_geometry(Rectangle::new(new_loc, new_size), true);
+                    } else {
+                        tile.set_location(pointer_loc - tile.size().downscale(2), true);
+                    }
+
+                    let output = workspace.output().clone();
+                    self.interactive_swap = Some(InteractiveSwap {
+                        tile,
+                        overlap_outputs: vec![output],
+                    });
                     return true;
                 }
             }
@@ -674,32 +912,104 @@ impl Space {
     pub fn handle_interactive_swap_motion(
         &mut self,
         window: &Window,
-        delta: Point<i32, Logical>,
+        pointer_loc: Point<i32, Logical>,
     ) -> bool {
-        for monitor in &mut self.monitors {
-            for workspace in monitor.workspaces_mut() {
-                if workspace.handle_interactive_swap_motion(window, delta) {
-                    return true;
-                }
-            }
+        let Some(interactive_swap) = &mut self.interactive_swap else {
+            return false;
+        };
+
+        if interactive_swap.tile.window() != window {
+            return false;
         }
 
-        false
+        let new_location = pointer_loc - interactive_swap.tile.visual_size().downscale(2);
+        interactive_swap.tile.set_location(new_location, false);
+
+        // Now, update the outputs the tile is overlapping with.
+        let new_geometry = interactive_swap.tile.geometry();
+        interactive_swap.overlap_outputs = self
+            .monitors
+            .iter()
+            .map(|mon| mon.output())
+            .filter(|o| o.geometry().intersection(new_geometry).is_some())
+            .cloned()
+            .collect();
+
+        true
     }
 
     /// Handle the iteractive swap motion for this window.
     ///
     /// Returns [`true`] if the grab should continue.
-    pub fn handle_interactive_swap_end(&mut self, window: &Window, position: Point<f64, Logical>) {
-        for monitor in &mut self.monitors {
-            for workspace in monitor.workspaces_mut() {
-                let position_in_workspace =
-                    position - workspace.output().current_location().to_f64();
-                if workspace.handle_interactive_swap_end(window, position_in_workspace) {
-                    return;
-                }
-            }
+    pub fn handle_interactive_swap_end(
+        &mut self,
+        window: &Window,
+        cursor_position: Point<f64, Logical>,
+    ) {
+        let Some(mut interactive_swap) = self.interactive_swap.take() else {
+            return;
+        };
+
+        if interactive_swap.tile.window() != window {
+            return;
         }
+
+        let monitor_under_idx = self
+            .monitors
+            .iter_mut()
+            .position(|mon| {
+                mon.output()
+                    .geometry()
+                    .contains(cursor_position.to_i32_round())
+            })
+            .expect("Cursor position out of space!");
+        let monitor_under = &mut self.monitors[monitor_under_idx];
+        let output_loc = monitor_under.output().current_location();
+        // Move the tile to the correct position relative to the output so that animation doesn't
+        // break, since handle_interactive_swap_motion sets the absolute position
+        interactive_swap
+            .tile
+            .set_location(interactive_swap.tile.visual_location() - output_loc, false);
+        monitor_under
+            .active_workspace_mut()
+            .insert_tile_with_cursor_position(
+                interactive_swap.tile,
+                cursor_position.to_i32_round() - output_loc,
+            );
+        self.active_idx = monitor_under_idx;
+    }
+
+    /// Renders the tile affected by the current interactive swap.
+    pub fn render_interactive_swap<R: FhtRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        scale: i32,
+    ) -> Vec<RelocateRenderElement<TileRenderElement<R>>> {
+        let Some(interactive_swap) = self.interactive_swap.as_ref() else {
+            return vec![];
+        };
+
+        if !interactive_swap.overlap_outputs.contains(output) {
+            return vec![];
+        }
+
+        // Usually, the tile's location is local, but in our case it is global due to how
+        // Space::handle_interactive_swap_motion is done.
+        // We just have to offset by the output location to render it accurately.
+        let output_loc = output.current_location().to_physical(scale);
+
+        interactive_swap
+            .tile
+            .render(renderer, scale, 1.0, output, Point::default(), false)
+            .map(|element| {
+                RelocateRenderElement::from_element(
+                    element,
+                    output_loc.upscale(-1),
+                    Relocate::Relative,
+                )
+            })
+            .collect()
     }
 
     /// Start an interactive resize in the [`Workspace`] of this [`Window`].

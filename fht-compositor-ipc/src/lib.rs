@@ -144,6 +144,8 @@ pub struct Output {
     pub scale: i32,
     /// Transform.
     pub transform: OutputTransform,
+    /// Active
+    pub active: bool,
 }
 
 /// Output mode.

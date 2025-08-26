@@ -370,6 +370,10 @@ impl State {
     fn handle_ipc_client_request(&mut self, req: ClientRequest) -> anyhow::Result<()> {
         match req {
             ClientRequest::Outputs(tx) => {
+                
+                let active_monitor = self.fht.space.active_monitor();
+                let active_output_name = active_monitor.output().name();
+
                 let outputs = self
                     .fht
                     .space
@@ -406,6 +410,8 @@ impl State {
                         let scale = output.current_scale().integer_scale();
                         let transform = output.current_transform().into();
 
+                        let active = name == active_output_name;
+
                         let ipc_output = fht_compositor_ipc::Output {
                             name: name.clone(),
                             make: props.make,
@@ -418,6 +424,7 @@ impl State {
                             size: (logical_size.w as u32, logical_size.h as u32),
                             scale,
                             transform,
+                            active,
                         };
 
                         (name, ipc_output)

@@ -132,6 +132,7 @@ fn print_formatted(res: &fht_compositor_ipc::Response) -> anyhow::Result<()> {
                 )?;
                 writeln!(&mut writer, "\tScale: {}", output.scale)?;
                 writeln!(&mut writer, "\tTransform: {:?}", output.transform)?;
+                writeln!(&mut writer, "\tActive: {:?}", output.active)?;
 
                 // Modes
                 writeln!(&mut writer, "\tModes:")?;

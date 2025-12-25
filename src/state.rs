@@ -71,7 +71,7 @@ use smithay::wayland::xdg_foreign::XdgForeignState;
 use crate::backend::Backend;
 use crate::config::ui as config_ui;
 use crate::cursor::CursorThemeManager;
-use crate::focus_target::PointerFocusTarget;
+use crate::focus_target::{PointerFocusTarget, KeyboardFocusTarget};
 use crate::frame_clock::FrameClock;
 use crate::handlers::session_lock::LockState;
 use crate::layer::MappedLayer;
@@ -1321,7 +1321,27 @@ impl Fht {
                 })
         };
 
-        let window_under = |fullscreen| {
+        let window_under = |fullscreen: bool| {
+
+            let pinned = if !fullscreen {
+                self.pinned_window_under(point)
+                    .map(|(w, loc)| (w, loc.to_i32_round())) // Convert back to i32 for internal consistency if needed
+            } else {
+                None
+            };
+
+            if let Some((window, window_loc)) = pinned {
+                let window_wl_surface = window.wl_surface().unwrap();
+                return window.surface_under(point - window_loc.to_f64(), WindowSurfaceType::ALL)
+                .map(|(surface, surface_loc)| {
+                    if surface == *window_wl_surface {
+                        (PointerFocusTarget::Window(window.clone()), window_loc.to_f64())
+                    } else {
+                        (PointerFocusTarget::from(surface), (surface_loc + window_loc).to_f64())
+                    }
+                });
+            }
+
             let maybe_window = if fullscreen {
                 self.space.fullscreened_window_under(point)
             } else {
@@ -1442,6 +1462,12 @@ impl Fht {
             window.send_frame(output, time, throttle, should_send_frames);
         }
 
+        if let Some(monitor) = self.space.monitors().find(|m| m.output() == output) {
+            for tile in &monitor.pinned_tiles {
+                tile.window().send_frame(output, time, throttle, should_send_frames);
+            }
+        }
+
         let map = layer_map_for_output(output);
         for layer_surface in map.layers() {
             layer_surface.send_frame(output, time, throttle, should_send_frames);
@@ -1512,11 +1538,9 @@ impl Fht {
         // Both windows and layer surfaces can only be drawn on a single output at a time, so there
         // no need to update all the windows of the output.
 
-        for window in self.space.visible_windows_for_output(output) {
+        let process_window = |window: &Window| {
             let offscreen_id = window.offscreen_element_id();
             window.with_surfaces(|surface, surface_data| {
-                // We do the work of update_surface_primary_scanout_output, but use our own
-                // offscreen Id if needed.
                 surface_data
                     .data_map
                     .insert_if_missing_threadsafe(Mutex::<PrimaryScanoutOutput>::default);
@@ -1542,6 +1566,16 @@ impl Fht {
                     });
                 }
             });
+        };
+
+        for window in self.space.visible_windows_for_output(output) {
+            process_window(window);
+        }
+
+        if let Some(monitor) = self.space.monitors().find(|m| m.output() == output) {
+            for tile in &monitor.pinned_tiles {
+                process_window(tile.window());
+            }
         }
 
         for surface in layer_map_for_output(output).layers() {
@@ -1636,6 +1670,23 @@ impl Fht {
             );
         }
 
+        if let Some(monitor) = self.space.monitors().find(|m| m.output() == output) {
+            for tile in &monitor.pinned_tiles {
+                tile.window().send_dmabuf_feedback(
+                    output,
+                    |_, _| Some(output.clone()),
+                    |surface, _| {
+                        select_dmabuf_feedback(
+                            surface,
+                            render_element_states,
+                            &feedback.render_feedback,
+                            &feedback.scanout_feedback,
+                        )
+                    },
+                );
+            }
+        }
+
         for surface in layer_map_for_output(output).layers() {
             surface.send_dmabuf_feedback(
                 output,
@@ -1704,6 +1755,18 @@ impl Fht {
             )
         }
 
+        if let Some(monitor) = self.space.monitors().find(|m| m.output() == output) {
+            for tile in &monitor.pinned_tiles {
+                tile.window().take_presentation_feedback(
+                    &mut output_presentation_feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(surface, render_element_states)
+                    },
+                )
+            }
+        }
+
         let map = layer_map_for_output(output);
         for layer_surface in map.layers() {
             layer_surface.take_presentation_feedback(
@@ -1758,9 +1821,7 @@ impl Fht {
         for monitor in self.space.monitors() {
             let output_name = monitor.output().name();
             for (ws_idx, workspace) in monitor.workspaces().enumerate() {
-                let Some(focused_idx) = workspace.active_tile_idx() else {
-                    continue; // No windows on the workspace, do not bother.
-                };
+                let focused_idx = workspace.active_tile_idx();
                 for (window_idx, window) in workspace.windows().enumerate() {
                     if !window.need_to_resolve_rules() {
                         continue;
@@ -1770,10 +1831,36 @@ impl Fht {
                         &self.config.rules,
                         &output_name,
                         ws_idx,
-                        window_idx == focused_idx,
+                        focused_idx.is_some_and(|idx| idx == window_idx),
                     );
                     window.set_rules(rules);
                 }
+            }
+
+            // Resolve for pinned windows
+            // We check the actual seat keyboard focus since pinned windows aren't managed by workspace indices.
+            let focused_target = self.seat.get_keyboard().and_then(|k| k.current_focus());
+
+            for tile in &monitor.pinned_tiles {
+                let window = tile.window();
+                if !window.need_to_resolve_rules() {
+                    continue;
+                }
+
+                let is_focused = focused_target
+                    .as_ref()
+                    .is_some_and(|target| {
+                        matches!(target, KeyboardFocusTarget::Window(w) if w == window)
+                    });
+
+                let rules = ResolvedWindowRules::resolve(
+                    window,
+                    &self.config.rules,
+                    &output_name,
+                    monitor.active_workspace_idx(),
+                    is_focused,
+                );
+                window.set_rules(rules);
             }
         }
     }
@@ -1981,6 +2068,22 @@ impl Fht {
             };
         });
     }
+
+    pub fn pinned_window_under(&self, point: Point<f64, Logical>) -> Option<(Window, Point<f64, Logical>)> {
+        let output = self.space.active_output();
+        let output_loc = output.current_location();
+        let point_in_output = point - output_loc.to_f64();
+        
+        // Find monitor corresponding to active output
+        for monitor in self.space.monitors() {
+            if monitor.output() == output {
+                if let Some((window, loc)) = monitor.pinned_window_under(point_in_output) {
+                    return Some((window, (loc + output_loc).to_f64()));
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Function to send frame callbacks for a single [`Window`] on the [`Output`].
@@ -2129,6 +2232,7 @@ pub struct ResolvedWindowRules {
     pub centered_in_parent: Option<bool>,
     pub vrr: Option<bool>,
     pub skip_focus: Option<bool>,
+    pub pinned: Option<bool>,
 }
 
 impl ResolvedWindowRules {
@@ -2215,6 +2319,10 @@ impl ResolvedWindowRules {
 
             if let Some(skip_focus) = rule.skip_focus {
                 resolved_rules.skip_focus = Some(skip_focus);
+            }
+            
+            if let Some(pinned) = rule.pinned {
+                resolved_rules.pinned = Some(pinned);
             }
         }
 

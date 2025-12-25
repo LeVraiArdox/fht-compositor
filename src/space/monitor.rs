@@ -4,9 +4,13 @@ use std::time::Duration;
 use fht_compositor_config::{
     GestureAction, GestureDirection, WorkspaceSwitchAnimation, WorkspaceSwitchAnimationDirection,
 };
+
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::output::Output;
-use smithay::utils::Point;
+use smithay::utils::{IsAlive, Point, Rectangle};
+use smithay::wayland::compositor::with_states;
+use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use super::workspace::{Workspace, WorkspaceRenderElement};
 use super::Config;
@@ -14,6 +18,9 @@ use crate::fht_render_elements;
 use crate::output::OutputExt;
 use crate::renderer::FhtRenderer;
 use crate::window::Window;
+use crate::input::resize_tile_grab::ResizeEdge;
+use crate::space::tile::{Tile, TileRenderElement};
+use crate::space::workspace::InteractiveResize;
 
 const WORKSPACE_COUNT: usize = 9;
 
@@ -45,6 +52,10 @@ pub struct Monitor {
     pub config: Rc<Config>,
     /// Swipe gesture state for the current swipe, if applicable
     pub swipe_state: Option<MonitorSwipeState>,
+    /// Pinned windows on this monitor
+    pub pinned_tiles: Vec<Tile>,
+    /// Active interactive resize for a pinned tile, if any
+    interactive_resize: Option<InteractiveResize>,
 }
 
 pub struct MonitorRenderResult<R: FhtRenderer> {
@@ -58,6 +69,7 @@ fht_render_elements! {
     MonitorRenderElement<R> => {
         Workspace = WorkspaceRenderElement<R>,
         SwitchingWorkspace = RelocateRenderElement<WorkspaceRenderElement<R>>,
+        Pinned = TileRenderElement<R>,
     }
 }
 
@@ -80,6 +92,8 @@ impl Monitor {
             is_active: false,
             config,
             swipe_state: None,
+            pinned_tiles: Vec::new(),
+            interactive_resize: None,
         }
     }
 
@@ -89,6 +103,14 @@ impl Monitor {
         self.is_active = is_active;
         for workspace in &mut self.workspaces {
             workspace.refresh();
+        }
+
+        // Refresh pinned tiles
+        self.pinned_tiles.retain(|tile| tile.window().alive());
+        for tile in &mut self.pinned_tiles {
+            // We pass 'false' for active here because focus is handled by State::update_keyboard_focus
+            // However, we ensure they are entered on the output
+            tile.refresh(&self.output, false);
         }
     }
 
@@ -439,56 +461,200 @@ impl Monitor {
         }
     }
 
-    /// Create the render elements for this [`Monitor`]
-    pub fn render<R: FhtRenderer>(&self, renderer: &mut R, scale: i32) -> MonitorRenderResult<R> {
-        crate::profile_function!();
-        let mut elements = vec![];
-        let mut elements_above_top = vec![];
+    /// Set whether a window should be pinned on this monitor
+    pub fn set_window_pinned(&mut self, window: &Window, pinned: bool) {
+        let is_currently_pinned = self.pinned_tiles.iter().any(|t| t.window() == window);
 
-        // If a swipe gesture is in progress, render accordingly
-        if let Some(swipe_state) = &self.swipe_state {
-            return self.render_with_swipe(renderer, scale, swipe_state);
+        if pinned && !is_currently_pinned {
+            if let Some(tile) = self.workspaces[self.active_idx].detach_window(window) {
+                window.request_tiled(false);
+                self.pinned_tiles.push(tile);
+            }
+        } else if !pinned && is_currently_pinned {
+            // Unpin: remove from pinned list and insert into the active workspace
+            if let Some(idx) = self.pinned_tiles.iter().position(|t| t.window() == window) {
+                let tile = self.pinned_tiles.remove(idx);
+                self.workspaces[self.active_idx].insert_tile(tile, None);
+            }
         }
+    }
 
-        // Normal behavior: render workspaces with their animations
-        for (idx, workspace) in self.workspaces.iter().enumerate() {
-            if idx == self.active_idx || workspace.render_offset().is_some() {
-                let render_above_top = workspace.fullscreened_tile_idx().is_some();
-                let elements = if render_above_top {
-                    &mut elements_above_top
-                } else {
-                    &mut elements
-                };
+    /// Get the pinned window under a given point, if any
+    pub fn pinned_window_under(&self, point: Point<f64, smithay::utils::Logical>) -> Option<(Window, Point<i32, smithay::utils::Logical>)> {
+        self.pinned_tiles.iter().rev().find_map(|tile| {
+            let loc = tile.location() + tile.window_loc();
+            let tile_geo = smithay::utils::Rectangle::new(loc, tile.window().size());
 
-                let render_offset = workspace.render_offset();
-                let ws_elements = workspace
-                    .render(renderer, scale, None)
-                    .into_iter()
-                    .map(Into::into);
+            if !tile_geo.to_f64().contains(point) {
+                return None;
+            }
 
-                if let Some(render_offset) = render_offset {
-                    let render_offset = render_offset.to_physical(scale);
-                    elements.extend(
-                        ws_elements
-                            .map(|e| {
-                                RelocateRenderElement::from_element(
-                                    e,
-                                    render_offset,
-                                    Relocate::Relative,
-                                )
-                            })
-                            .map(Into::into),
-                    )
-                } else {
-                    elements.extend(ws_elements.map(Into::into))
-                }
+            tile.window().surface_under(point - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+                .map(|(_, surf_loc)| (tile.window().clone(), loc + surf_loc))
+        })
+    }
+
+    pub fn start_interactive_resize(&mut self, window: &Window, edges: ResizeEdge) -> bool {
+        if self.interactive_resize.is_none() {
+            if let Some(tile) = self.pinned_tiles.iter().find(|t| t.window() == window) {
+                let loc = tile.visual_location();
+                let size = window.size();
+                self.interactive_resize = Some(InteractiveResize {
+                    window: window.clone(),
+                    initial_window_geometry: Rectangle::new(loc, size),
+                    edges,
+                });
+                return true;
             }
         }
 
-        MonitorRenderResult {
-            elements,
-            elements_above_top,
+        // Fallback to workspaces
+        for workspace in &mut self.workspaces {
+            if workspace.start_interactive_resize(window, edges) {
+                return true;
+            }
         }
+
+        false
+    }
+
+    pub fn handle_interactive_resize_motion(
+        &mut self,
+        window: &Window,
+        delta: Point<i32, smithay::utils::Logical>,
+    ) -> bool {
+        if let Some(interactive_resize) = &self.interactive_resize {
+            if interactive_resize.window == *window {
+                let mut new_size = interactive_resize.initial_window_geometry.size;
+                let mut new_loc = interactive_resize.initial_window_geometry.loc;
+                let (mut dx, mut dy) = (delta.x, delta.y);
+
+                if interactive_resize.edges.intersects(ResizeEdge::LEFT) {
+                    new_loc.x += dx;
+                    dx = -dx;
+                }
+                if interactive_resize.edges.intersects(ResizeEdge::TOP) {
+                    new_loc.y += dy;
+                    dy = -dy;
+                }
+                if interactive_resize
+                    .edges
+                    .intersects(ResizeEdge::LEFT | ResizeEdge::RIGHT)
+                {
+                    new_size.w += dx;
+                }
+                if interactive_resize
+                    .edges
+                    .intersects(ResizeEdge::TOP | ResizeEdge::BOTTOM)
+                {
+                    new_size.h += dy;
+                }
+
+                let (min_size, max_size) =
+                    with_states(&window.wl_surface().unwrap(), |data| {
+                        let mut cached = data.cached_state.get::<SurfaceCachedState>();
+                        let d = cached.current();
+                        (d.min_size, d.max_size)
+                    });
+                new_size = crate::space::workspace::clamp_size(new_size, min_size, max_size);
+
+                window.request_size(new_size);
+                window.send_configure();
+
+                if let Some(tile) = self.pinned_tiles.iter_mut().find(|t| t.window() == window) {
+                    tile.set_location(new_loc, false);
+                }
+                return true;
+            }
+        }
+
+        // Fallback to workspaces
+        for workspace in &mut self.workspaces {
+            if workspace.handle_interactive_resize_motion(window, delta) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn handle_interactive_resize_end(
+        &mut self,
+        window: &Window,
+        position: Point<f64, smithay::utils::Logical>,
+    ) -> bool {
+        if let Some(ir) = &self.interactive_resize {
+            if ir.window == *window {
+                self.interactive_resize = None;
+                return true;
+            }
+        }
+
+        // Fallback to workspaces
+        let position_in_workspace = position - self.output.current_location().to_f64();
+        for workspace in &mut self.workspaces {
+            if workspace.handle_interactive_resize_end(window, position_in_workspace) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Create the render elements for this [`Monitor`]
+    pub fn render<R: FhtRenderer>(&self, renderer: &mut R, scale: i32) -> MonitorRenderResult<R> {
+        crate::profile_function!();
+        let mut result = if let Some(swipe_state) = &self.swipe_state {
+            self.render_with_swipe(renderer, scale, swipe_state)
+        } else {
+            let mut elements = vec![];
+            let mut elements_above_top = vec![];
+            for (idx, workspace) in self.workspaces.iter().enumerate() {
+                if idx == self.active_idx || workspace.render_offset().is_some() {
+                    let render_above_top = workspace.fullscreened_tile_idx().is_some();
+                    let target = if render_above_top {
+                        &mut elements_above_top
+                    } else {
+                        &mut elements
+                    };
+
+                    let render_offset = workspace.render_offset();
+                    let ws_elements = workspace
+                        .render(renderer, scale, None)
+                        .into_iter()
+                        .map(Into::into);
+
+                    if let Some(offset) = render_offset {
+                        let offset = offset.to_physical(scale);
+                        target.extend(ws_elements.map(|e| {
+                            RelocateRenderElement::from_element(
+                                e,
+                                offset,
+                                smithay::backend::renderer::element::utils::Relocate::Relative,
+                            )
+                            .into()
+                        }));
+                    } else {
+                        target.extend(ws_elements.map(Into::into));
+                    }
+                }
+            }
+            MonitorRenderResult {
+                elements,
+                elements_above_top,
+            }
+        };
+
+        // Render pinned tiles on top of everything (elements_above_top)
+        // Pinned windows should be visible even above fullscreen workspace windows
+        for tile in &self.pinned_tiles {
+            result.elements_above_top.extend(
+                tile.render(renderer, scale, 1.0, &self.output, Point::default())
+                    .map(Into::into),
+            );
+        }
+
+        result
     }
 
     /// Render with a swipe gesture in progress

@@ -49,10 +49,10 @@ impl std::ops::Deref for WorkspaceId {
 }
 
 #[derive(Debug)]
-struct InteractiveResize {
-    window: Window,
-    initial_window_geometry: Rectangle<i32, Logical>,
-    edges: ResizeEdge,
+pub(crate) struct InteractiveResize {
+    pub window: Window,
+    pub initial_window_geometry: Rectangle<i32, Logical>,
+    pub edges: ResizeEdge,
 }
 
 #[derive(Debug)]
@@ -1992,6 +1992,93 @@ impl Workspace {
         }
 
         elements
+    }
+
+    /// Detach a [`Window`] from this [`Workspace`], returning its [`Tile`].
+    ///
+    /// This removes the window from the workspace management but keeps the [`Tile`] alive,
+    /// useful for moving the window to the pinned list or another container.
+    pub fn detach_window(&mut self, window: &Window) -> Option<Tile> {
+        let idx = self.tiles.iter().position(|tile| tile.window() == window)?;
+
+        // Handle fullscreen
+        if self.fullscreened_tile_idx.take_if(|&mut fs_idx| fs_idx == idx).is_some() {
+            self.start_fullscreen_fade_in(None);
+        } else {
+            self.remove_current_fullscreen();
+        }
+
+        let tile = self.tiles.remove(idx);
+
+        // Fix up active index
+        if self.tiles.is_empty() {
+            self.active_tile_idx = None
+        } else {
+            let active_idx = self.active_tile_idx.unwrap_or(0);
+            self.active_tile_idx = Some(active_idx.clamp(0, self.tiles.len() -1));
+        }
+
+        self.refresh();
+        self.arrange_tiles(true);
+
+        Some(tile)
+    }
+
+    /// Insert an existing [`Tile`] into this [`Workspace`]
+    pub fn insert_tile(
+        &mut self,
+        mut tile: Tile,
+        location: Option<Point<i32, Logical>>
+    ) {
+        if self.tiles.iter().any(|t| t.window() == tile.window()) {
+            return;
+        }
+        self.remove_current_fullscreen();
+
+        // Update tile conf to match this ws
+        tile.update_config(Rc::clone(&self.config));
+
+        let window = tile.window().clone();
+        // Config for output (size/bounds)
+        window.request_bounds(Some(self.output.geometry().size));
+        window.configure_for_output(&self.output);
+        let skip_focus = window.rules().skip_focus.unwrap_or(false);
+        let is_floating = !window.tiled();
+
+        // Use insert logic for location/centering if floating
+        if is_floating {
+            if let Some(loc) = location {
+                tile.set_location(loc, false);
+            }
+        }
+
+        // Insert strategy
+        let new_idx = match self.config.insert_window_strategy {
+            InsertWindowStrategy::EndOfSlaveStack => {
+                self.tiles.push(tile);
+                self.tiles.len() - 1
+            }
+            InsertWindowStrategy::ReplaceMaster => {
+                self.tiles.insert(0, tile);
+                0
+            }
+            InsertWindowStrategy::AfterFocused => {
+                let active_idx = self.active_tile_idx.map_or(0, |idx| idx + 1);
+                if active_idx == self.tiles.len() {
+                    self.tiles.push(tile);
+                    self.tiles.len() - 1
+                } else {
+                    self.tiles.insert(active_idx, tile);
+                    active_idx
+                }
+            }
+        };
+
+        if self.config.focus_new_windows && !skip_focus {
+            self.active_tile_idx = Some(new_idx);
+        }
+
+        self.arrange_tiles(true);
     }
 }
 

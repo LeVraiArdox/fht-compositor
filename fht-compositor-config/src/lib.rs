@@ -221,6 +221,7 @@ pub enum SimpleKeyAction {
     FullscreenFocusedWindow,
     FloatFocusedWindow,
     CenterFloatingWindow,
+    PinFocusedWindow,
     FocusNextWindow,
     FocusPreviousWindow,
     SwapWithNextWindow,
@@ -247,6 +248,7 @@ pub enum ComplexKeyAction {
     FullscreenFocusedWindow,
     FloatFocusedWindow,
     CenterFloatingWindow,
+    PinFocusedWindow,
     MoveFloatingWindow([i32; 2]),
     ResizeFloatingWindow([i32; 2]),
     FocusNextWindow,
@@ -1195,6 +1197,7 @@ pub struct WindowRule {
     pub floating: Option<bool>,
     pub ontop: Option<bool>,
     pub centered: Option<bool>, // only effective if floating == Some(true)
+    pub pinned: Option<bool>,
     pub vrr: Option<bool>,      // only effective when the window is on the primary plane
     pub skip_focus: Option<bool>,
 }

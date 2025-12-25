@@ -35,6 +35,7 @@ pub enum KeyActionType {
     FullscreenFocusedWindow,
     FloatFocusedWindow,
     CenterFloatingWindow,
+    PinFocusedWindow,
     MoveFloatingWindow([i32; 2]),
     ResizeFloatingWindow([i32; 2]),
     FocusNextWindow,
@@ -99,6 +100,7 @@ impl From<fht_compositor_config::KeyActionDesc> for KeyAction {
                     SimpleKeyAction::FloatFocusedWindow => KeyActionType::FloatFocusedWindow,
                     SimpleKeyAction::FocusNextWindow => KeyActionType::FocusNextWindow,
                     SimpleKeyAction::CenterFloatingWindow => KeyActionType::CenterFloatingWindow,
+                    SimpleKeyAction::PinFocusedWindow => KeyActionType::PinFocusedWindow,
                     SimpleKeyAction::FocusPreviousWindow => KeyActionType::FocusPreviousWindow,
                     SimpleKeyAction::SwapWithNextWindow => KeyActionType::SwapWithNextWindow,
                     SimpleKeyAction::SwapWithPreviousWindow => {
@@ -132,6 +134,7 @@ impl From<fht_compositor_config::KeyActionDesc> for KeyAction {
                     }
                     ComplexKeyAction::FloatFocusedWindow => KeyActionType::FloatFocusedWindow,
                     ComplexKeyAction::CenterFloatingWindow => KeyActionType::CenterFloatingWindow,
+                    ComplexKeyAction::PinFocusedWindow => KeyActionType::PinFocusedWindow,
                     ComplexKeyAction::MoveFloatingWindow(change) => {
                         KeyActionType::MoveFloatingWindow(change)
                     }
@@ -242,6 +245,38 @@ impl State {
                     if !tile.window().tiled() {
                         let size = tile.size();
                         tile.set_location(output_geometry.center() - size.downscale(2), true);
+                    }
+                }
+            }
+            KeyActionType::PinFocusedWindow => {
+                if let Some(window) = active_window {
+                    let new_loc = {
+                        let monitor = self.fht.space.active_monitor_mut();
+                        let is_pinned = monitor.pinned_tiles.iter().any(|t| t.window() == &window);
+                        monitor.set_window_pinned(&window, !is_pinned);
+
+                        if config.general.cursor_warps {
+                            if !is_pinned {
+                                monitor
+                                    .pinned_tiles
+                                    .iter()
+                                    .find(|t| t.window() == &window)
+                                    .map(|t| {
+                                        t.visual_location() + monitor.output().current_location()
+                                    })
+                            } else {
+                                self.fht.space.window_location(&window)
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    self.set_keyboard_focus(Some(window.clone()));
+
+                    if let Some(loc) = new_loc {
+                        let center = Rectangle::new(loc, window.size()).center().to_f64();
+                        self.move_pointer(center);
                     }
                 }
             }
@@ -497,11 +532,21 @@ impl State {
                 if let Some((PointerFocusTarget::Window(window), _)) =
                     self.fht.focus_target_under(pointer_loc)
                 {
-                    let workspace = self.fht.space.workspace_for_window(&window).unwrap();
-                    match (window.tiled(), workspace.current_layout()) {
-                        (_, WorkspaceLayout::Floating) | (false, _) => (),
-                        // We only do interactive resizes on floating windows
-                        (true, _) => return,
+                    // Check if we can resize. 
+                    // Pinned windows are always floating/resizable.
+                    // Workspace windows are resizable if floating or if the layout supports it.
+                    let is_resizable = if let Some(workspace) = self.fht.space.workspace_for_window(&window) {
+                        matches!(
+                            (window.tiled(), workspace.current_layout()),
+                            (_, WorkspaceLayout::Floating) | (false, _)
+                        )
+                    } else {
+                        // If not in a workspace, it must be pinned (floating)
+                        true
+                    };
+
+                    if !is_resizable {
+                        return;
                     }
 
                     let pointer_loc = self.fht.pointer.current_location();
@@ -518,8 +563,6 @@ impl State {
 
                     let size = size.to_f64();
                     let pointer_loc_in_window = pointer_loc_in_window.to_f64();
-                    // We divide the window into 9 sections, so that if you grab for example
-                    // somewhere in the middle of the bottom edge, you can only resize vertically.
                     let mut edges = ResizeEdge::empty();
                     if pointer_loc_in_window.x < size.w / 3. {
                         edges |= ResizeEdge::LEFT;
@@ -538,18 +581,20 @@ impl State {
                         button,
                         location: pointer_loc,
                     };
-                    let output = workspace.output().clone();
-                    if self.fht.space.start_interactive_resize(&window, edges) {
-                        window.request_resizing(true);
-                        let grab = ResizeTileGrab {
-                            window,
-                            output,
-                            start_data,
-                        };
-                        pointer.set_grab(self, grab, serial, Focus::Clear);
-                        self.fht
-                            .cursor_theme_manager
-                            .set_image_status(CursorImageStatus::Named(edges.cursor_icon()));
+                    
+                    if let Some(output) = self.fht.space.output_for_window(&window).cloned() {
+                        if self.fht.space.start_interactive_resize(&window, edges) {
+                            window.request_resizing(true);
+                            let grab = ResizeTileGrab {
+                                window,
+                                output,
+                                start_data,
+                            };
+                            pointer.set_grab(self, grab, serial, Focus::Clear);
+                            self.fht
+                                .cursor_theme_manager
+                                .set_image_status(CursorImageStatus::Named(edges.cursor_icon()));
+                        }
                     }
                 }
             }

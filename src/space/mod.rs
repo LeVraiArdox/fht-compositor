@@ -1045,13 +1045,10 @@ impl Space {
     /// Returns [`true`] if the grab got started inside the [`Workspace`].
     pub fn start_interactive_resize(&mut self, window: &Window, edges: ResizeEdge) -> bool {
         for monitor in &mut self.monitors {
-            for workspace in monitor.workspaces_mut() {
-                if workspace.start_interactive_resize(window, edges) {
-                    return true;
-                }
+            if monitor.start_interactive_resize(window, edges) {
+                return true;
             }
         }
-
         false
     }
 
@@ -1064,13 +1061,10 @@ impl Space {
         delta: Point<i32, Logical>,
     ) -> bool {
         for monitor in &mut self.monitors {
-            for workspace in monitor.workspaces_mut() {
-                if workspace.handle_interactive_resize_motion(window, delta) {
-                    return true;
-                }
+            if monitor.handle_interactive_resize_motion(window, delta) {
+                return true;
             }
         }
-
         false
     }
 
@@ -1083,14 +1077,25 @@ impl Space {
         position: Point<f64, Logical>,
     ) {
         for monitor in &mut self.monitors {
-            for workspace in monitor.workspaces_mut() {
-                let position_in_workspace =
-                    position - workspace.output().current_location().to_f64();
-                if workspace.handle_interactive_resize_end(window, position_in_workspace) {
-                    return;
-                }
+            let position_in_monitor = position - monitor.output().current_location().to_f64();
+            
+            if monitor.handle_interactive_resize_end(window, position_in_monitor) {
+                return;
             }
         }
+    }
+
+    /// Get the [`Output`] holding this window.
+    pub fn output_for_window(&self, window: &Window) -> Option<&Output> {
+        // Check pinned windows first
+        for monitor in &self.monitors {
+            if monitor.pinned_tiles.iter().any(|t| t.window() == window) {
+                return Some(monitor.output());
+            }
+        }
+        
+        // Then check workspaces
+        self.workspace_for_window(window).map(|ws| ws.output())
     }
 }
 

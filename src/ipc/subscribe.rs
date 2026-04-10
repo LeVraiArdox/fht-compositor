@@ -172,6 +172,7 @@ impl Fht {
                         id: *window.id(),
                         title: window.title(),
                         app_id: window.app_id(),
+                        wayland_id: window.foreign_toplevel_handle().map(|h| h.identifier()),
                         workspace_id: *workspace_id,
                         size: (size.w as u32, size.h as u32),
                         location: location.into(),

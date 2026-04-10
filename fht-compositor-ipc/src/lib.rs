@@ -261,6 +261,8 @@ pub struct Window {
     ///
     /// It is **not** unique! And you should make no assumptions about its contents.
     pub app_id: Option<String>,
+    /// The wayland identifier of this window's surface. Retrieved from the `ext_foreign_toplevel_list_v1` protocol.
+    pub wayland_id: Option<String>,
     /// The workspace ID this window is on.
     pub workspace_id: usize,
     /// The size of this window.
